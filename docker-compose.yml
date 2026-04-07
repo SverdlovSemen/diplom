@@ -1,0 +1,98 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-gauges}
+      POSTGRES_USER: ${POSTGRES_USER:-gauges}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-gauges}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  nginx-rtmp:
+    image: tiangolo/nginx-rtmp:latest
+    ports:
+      - "${RTMP_PORT:-1935}:1935"
+      - "${RTMP_HTTP_PORT:-8080}:8080"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8080/healthz | grep -q ok"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  # Тестовый publisher (опционально): зацикленный testsrc → flv1 → nginx-rtmp по bridge-сети.
+  # Запуск: docker compose --profile test-stream up -d
+  # Примечание: network_mode: service:nginx-rtmp не работает на Docker Desktop Windows (WSL2) —
+  # loopback 127.0.0.1:1935 внутри netns nginx не доступен из контейнера-соседа,
+  # поэтому используем обычный bridge и hostname nginx-rtmp.
+  ffmpeg-test:
+    build:
+      context: ./docker/ffmpeg-test
+    profiles: ["test-stream"]
+    depends_on:
+      nginx-rtmp:
+        condition: service_healthy
+    environment:
+      FFMPEG_RTMP_URL: rtmp://nginx-rtmp:1935/live/logger-2
+    restart: unless-stopped
+
+  backend:
+    build:
+      context: ./backend
+    environment:
+      APP_ENV: ${APP_ENV:-dev}
+      APP_LOG_LEVEL: ${APP_LOG_LEVEL:-INFO}
+      APP_CORS_ORIGINS: ${APP_CORS_ORIGINS:-http://localhost:5173}
+      APP_DATABASE_URL: ${APP_DATABASE_URL:-postgresql+asyncpg://gauges:gauges@postgres:5432/gauges}
+      APP_REDIS_URL: ${APP_REDIS_URL:-redis://redis:6379/0}
+      APP_STORAGE_DIR: ${APP_STORAGE_DIR:-/data}
+      APP_PROCESSING_TICK_SEC: ${APP_PROCESSING_TICK_SEC:-1}
+      APP_RTMP_BASE_URL: ${APP_RTMP_BASE_URL:-rtmp://nginx-rtmp:1935/live}
+      APP_RTMP_STAT_URL: ${APP_RTMP_STAT_URL:-http://nginx-rtmp:8080/stat}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      nginx-rtmp:
+        condition: service_healthy
+    ports:
+      - "${BACKEND_PORT:-8000}:8000"
+    volumes:
+      - backend_data:/data
+
+  frontend:
+    build:
+      context: ./frontend
+    environment:
+      VITE_API_BASE_URL: ${VITE_API_BASE_URL:-http://localhost:8000}
+    depends_on:
+      - backend
+    ports:
+      - "${FRONTEND_PORT:-5173}:5173"
+
+volumes:
+  postgres_data:
+  redis_data:
+  backend_data:
