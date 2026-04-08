@@ -1,5 +1,5 @@
 #!/bin/sh
-# Бесконечный publisher. Публикует testsrc в nginx-rtmp по Docker bridge-сети.
+# Бесконечный publisher. Публикует black background + white number в nginx-rtmp по Docker bridge-сети.
 # - network_mode: service:nginx-rtmp не используется (не работает на Docker Desktop Windows).
 # - libx264 + SPS/PPS sequence header: nginx-rtmp кэширует заголовок и сразу отдаёт
 #   подписчикам — они декодируют с первого кадра без ожидания keyframe.
@@ -13,7 +13,8 @@ echo "ffmpeg-test: loop publish -> $URL"
 while true; do
   ffmpeg -hide_banner -nostdin -loglevel warning \
     -re \
-    -f lavfi -i "testsrc=size=640x480:rate=25" \
+    -f lavfi -i "color=c=black:s=640x480:r=25" \
+    -vf "drawtext=fontfile=/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf:text='%{eif\\:mod(t\\,1000)\\:d}':fontcolor=white:fontsize=120:x=(w-text_w)/2:y=(h-text_h)/2" \
     -pix_fmt yuv420p \
     -c:v libx264 -preset ultrafast -tune zerolatency \
     -g 25 -keyint_min 25 \
