@@ -28,7 +28,7 @@ export type Logger = {
   updated_at: string;
 };
 
-export type LoggerCreate = Omit<Logger, "id" | "created_at" | "updated_at">;
+export type LoggerCreate = Omit<Logger, "id" | "created_at" | "updated_at" | "status">;
 export type LoggerUpdate = Partial<LoggerCreate>;
 
 export async function listLoggers(): Promise<Logger[]> {

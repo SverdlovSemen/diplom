@@ -14,7 +14,8 @@ from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
-from app.cv.recognizer import recognize_from_image
+from app.cv.recognizer import analog_debug_from_image, recognize_from_image
+from app.models.logger import GaugeType
 from app.db.session import get_db_session
 from app.processing.pipeline import (
     capture_frame_to_memory,
@@ -181,6 +182,11 @@ async def api_test_recognize(
                 },
             )
 
+        analog_debug: dict[str, Any] | None = None
+        if target.gauge_type == GaugeType.analog:
+            calibration_data = _parse_json(target.calibration_json)
+            analog_debug = analog_debug_from_image(roi_image, calibration_data)
+
         return {
             "value": cv_result.value,
             "ok": cv_result.ok,
@@ -188,6 +194,7 @@ async def api_test_recognize(
             "roi_image": roi_b64,
             "ocr_raw": cv_result.ocr_raw,
             "frame_source": frame_source,
+            "analog_debug": analog_debug,
         }
     except HTTPException:
         raise

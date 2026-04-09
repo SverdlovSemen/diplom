@@ -33,6 +33,15 @@ export type TestRecognizeResult = {
   ocr_raw?: string | null;
   /** client_jpeg — тот же кадр, что в UI; rtmp_capture — новый захват с потока */
   frame_source?: string | null;
+  analog_debug?: {
+    tip_point?: { x: number; y: number } | null;
+    angle?: number | null;
+    min_angle?: number | null;
+    max_angle?: number | null;
+    ratio?: number | null;
+    quality_score?: number | null;
+    warnings?: string[];
+  } | null;
 };
 
 export type TestRecognizeBody = {

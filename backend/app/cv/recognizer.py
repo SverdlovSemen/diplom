@@ -302,6 +302,104 @@ def _recognize_analog(image: np.ndarray, calibration_data: dict[str, Any]) -> CV
     return CVResult(value=value, ok=True)
 
 
+def analog_debug_from_image(image: np.ndarray, calibration_data: dict[str, Any]) -> dict[str, Any]:
+    """Диагностика analog-распознавания для UI setup/test."""
+    out: dict[str, Any] = {
+        "tip_point": None,
+        "angle": None,
+        "min_angle": None,
+        "max_angle": None,
+        "ratio": None,
+        "quality_score": None,
+        "warnings": [],
+    }
+
+    center_data = calibration_data.get("center")
+    min_point_data = calibration_data.get("min_point")
+    max_point_data = calibration_data.get("max_point")
+    if not (center_data and min_point_data and max_point_data):
+        out["warnings"] = ["missing_center_or_minmax_points"]
+        return out
+
+    center = (float(center_data["x"]), float(center_data["y"]))
+    min_point = (float(min_point_data["x"]), float(min_point_data["y"]))
+    max_point = (float(max_point_data["x"]), float(max_point_data["y"]))
+    expected_len = (
+        math.hypot(min_point[0] - center[0], min_point[1] - center[1])
+        + math.hypot(max_point[0] - center[0], max_point[1] - center[1])
+    ) / 2.0
+    if expected_len < 8:
+        out["warnings"] = ["expected_length_too_small"]
+        return out
+    near_center_thr = max(18.0, expected_len * 0.25)
+    min_tip_len = max(24.0, expected_len * 0.35)
+
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    gray = cv2.GaussianBlur(gray, (5, 5), 0)
+    lines: Any = None
+    for low, high, hough_thr in ((60, 140, 40), (80, 160, 45), (100, 200, 50)):
+        edges = cv2.Canny(gray, low, high)
+        lines = cv2.HoughLinesP(
+            edges,
+            1,
+            np.pi / 180,
+            threshold=hough_thr,
+            minLineLength=max(24, int(round(expected_len * 0.25))),
+            maxLineGap=14,
+        )
+        if lines is not None:
+            break
+
+    best_tip: tuple[float, float] | None = None
+    best_score = -1.0
+    line_count = 0
+    if lines is not None:
+        line_count = int(len(lines))
+        for item in lines:
+            x1, y1, x2, y2 = item[0]
+            p1 = (float(x1), float(y1))
+            p2 = (float(x2), float(y2))
+            d1 = math.hypot(p1[0] - center[0], p1[1] - center[1])
+            d2 = math.hypot(p2[0] - center[0], p2[1] - center[1])
+            center_to_segment = _point_to_segment_distance(center, p1, p2)
+            if center_to_segment > near_center_thr:
+                continue
+            tip = p1 if d1 > d2 else p2
+            tip_len = max(d1, d2)
+            if tip_len < min_tip_len:
+                continue
+            score = tip_len - center_to_segment * 0.8
+            if score > best_score:
+                best_tip = tip
+                best_score = score
+
+    if best_tip is None:
+        best_tip = _estimate_tip_from_dark_pixels(image, center, expected_len)
+        if best_tip is None:
+            out["warnings"] = ["needle_not_found", f"hough_lines={line_count}"]
+            return out
+        out["warnings"] = ["tip_from_dark_pixels_fallback"]
+    else:
+        out["quality_score"] = round(float(best_score), 3)
+
+    angle = _angle_from_center(center, best_tip)
+    min_angle = _angle_from_center(center, min_point)
+    max_angle = _angle_from_center(center, max_point)
+    span = _angle_delta_deg(min_angle, max_angle)
+    if abs(span) < 1e-4:
+        out["warnings"] = ["invalid_calibration_angle_span"]
+        return out
+    ratio = _angle_delta_deg(min_angle, angle) / span
+    out["tip_point"] = {"x": round(float(best_tip[0]), 2), "y": round(float(best_tip[1]), 2)}
+    out["angle"] = round(float(angle), 3)
+    out["min_angle"] = round(float(min_angle), 3)
+    out["max_angle"] = round(float(max_angle), 3)
+    out["ratio"] = round(float(ratio), 5)
+    if ratio < -0.03 or ratio > 1.03:
+        out["warnings"] = [*out["warnings"], "tip_outside_minmax_span"]
+    return out
+
+
 def recognize_from_image(image: np.ndarray, logger: Logger, *, roi_json_override: str | None = None) -> CVResult:
     roi_data = _parse_json(roi_json_override if roi_json_override is not None else logger.roi_json)
     calibration_data = _parse_json(logger.calibration_json)
