@@ -35,6 +35,21 @@ cd gauge-reader-system\scripts
 .\test_stream.bat logger-1
 ```
 
+Аналоговый поток со стрелкой (logger-1, смена кадра раз в 8 сек):
+
+```bat
+cd gauge-reader-system\scripts
+py .\generate_analog_sequence.py
+.\test_analog_stream.bat logger-1 127.0.0.1 8
+```
+
+Для `logger-1` в `Logger setup` используйте калибровку из файла:
+- `test_images/analog_sequence/calibration_logger1.json`
+- `roi_json` оставьте на весь кадр: `{"x":0,"y":0,"w":640,"h":480}`
+
+Рекомендуемый интервал опроса для этого теста:
+- `sample_interval_sec = 8` (или 7-10)
+
 Если `localhost` не работает (в рамках Docker), укажите `host.docker.internal`:
 
 ```bat
@@ -50,6 +65,14 @@ cd gauge-reader-system/scripts
 
 Проверка статуса RTMP (nginx):
 - `http://localhost:8080/stat` (должен быть виден активный поток)
+
+### Два потока одновременно (docker profiles)
+
+- Цифровой тестовый поток (`logger-2`):
+  - `docker compose --profile test-stream up -d ffmpeg-test`
+- Аналоговый поток со стрелкой (`logger-1`):
+  - `py scripts/generate_analog_sequence.py`
+  - `docker compose --profile test-stream-analog up -d ffmpeg-analog`
 
 ## Миграции БД (Alembic)
 

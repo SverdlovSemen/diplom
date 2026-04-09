@@ -49,12 +49,31 @@ services:
   ffmpeg-test:
     build:
       context: ./docker/ffmpeg-test
-    profiles: ["test-stream"]
+    #profiles: ["test-stream"]
     depends_on:
       nginx-rtmp:
         condition: service_healthy
     environment:
       FFMPEG_RTMP_URL: rtmp://nginx-rtmp:1935/live/logger-2
+    restart: unless-stopped
+
+  # Тестовый publisher для аналогового logger-1: крутит набор кадров со стрелкой.
+  # Перед запуском сгенерируйте кадры:
+  #   py scripts/generate_analog_sequence.py
+  # Запуск: docker compose --profile test-stream-analog up -d
+  ffmpeg-analog:
+    build:
+      context: ./docker/ffmpeg-analog
+    #profiles: ["test-stream-analog"]
+    depends_on:
+      nginx-rtmp:
+        condition: service_healthy
+    environment:
+      FFMPEG_RTMP_URL: rtmp://nginx-rtmp:1935/live/logger-1
+      ANALOG_HOLD_SEC: ${ANALOG_HOLD_SEC:-8}
+      ANALOG_FRAMES_DIR: /frames
+    volumes:
+      - ./test_images/analog_sequence:/frames:ro
     restart: unless-stopped
 
   backend:

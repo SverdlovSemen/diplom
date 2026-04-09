@@ -47,7 +47,7 @@ export function LoggerSetupPage(): React.ReactElement {
   const { loggerId } = useParams();
   const [roiJson, setRoiJson] = React.useState('{"x": 0, "y": 0, "w": 640, "h": 480}');
   const [calibrationJson, setCalibrationJson] = React.useState(
-    '{"center":{"x":320,"y":240},"min_point":{"x":100,"y":380},"max_point":{"x":540,"y":380},"min_value":0,"max_value":10}',
+    '{"center":{"x":320,"y":297},"min_point":{"x":231,"y":386},"max_point":{"x":409,"y":386},"min_value":0,"max_value":100}',
   );
   const [measurements, setMeasurements] = React.useState<Measurement[]>([]);
   const [status, setStatus] = React.useState<string | null>(null);

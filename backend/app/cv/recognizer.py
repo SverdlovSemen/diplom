@@ -154,6 +154,75 @@ def _angle_from_center(center: tuple[float, float], point: tuple[float, float]) 
     return math.degrees(math.atan2(dy, dx))
 
 
+def _point_to_segment_distance(
+    p: tuple[float, float],
+    a: tuple[float, float],
+    b: tuple[float, float],
+) -> float:
+    ax, ay = a
+    bx, by = b
+    px, py = p
+    abx = bx - ax
+    aby = by - ay
+    apx = px - ax
+    apy = py - ay
+    denom = abx * abx + aby * aby
+    if denom <= 1e-8:
+        return math.hypot(px - ax, py - ay)
+    t = (apx * abx + apy * aby) / denom
+    t = max(0.0, min(1.0, t))
+    cx = ax + t * abx
+    cy = ay + t * aby
+    return math.hypot(px - cx, py - cy)
+
+
+def _angle_delta_deg(start: float, end: float) -> float:
+    d = end - start
+    while d <= -180.0:
+        d += 360.0
+    while d > 180.0:
+        d -= 360.0
+    return d
+
+
+def _estimate_tip_from_dark_pixels(
+    image: np.ndarray,
+    center: tuple[float, float],
+    expected_len: float,
+) -> tuple[float, float] | None:
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    # Для тестовых/контрастных стрелок: берём только тёмные пиксели.
+    _, dark = cv2.threshold(gray, 80, 255, cv2.THRESH_BINARY_INV)
+    h, w = gray.shape[:2]
+    yy, xx = np.mgrid[0:h, 0:w]
+    dx = xx.astype(np.float32) - float(center[0])
+    dy = float(center[1]) - yy.astype(np.float32)
+    r = np.sqrt(dx * dx + dy * dy)
+    annulus = (r >= max(18.0, expected_len * 0.2)) & (r <= expected_len * 1.15)
+    mask = (dark > 0) & annulus
+    if int(mask.sum()) < 30:
+        return None
+
+    sel_dx = dx[mask]
+    sel_dy = dy[mask]
+    sel_r = r[mask]
+    angles = np.degrees(np.arctan2(sel_dy, sel_dx))
+    bins = ((angles + 180.0) % 360.0).astype(np.int32)
+    hist = np.bincount(bins, weights=sel_r, minlength=360)
+    best_bin = int(np.argmax(hist))
+    if hist[best_bin] <= 0:
+        return None
+    # Берём дальнюю точку в узком угловом окне.
+    diff = np.abs(((bins - best_bin + 180) % 360) - 180)
+    near = diff <= 4
+    if int(np.count_nonzero(near)) == 0:
+        return None
+    idx = int(np.argmax(sel_r[near]))
+    pts_x = xx[mask][near]
+    pts_y = yy[mask][near]
+    return float(pts_x[idx]), float(pts_y[idx])
+
+
 def _recognize_analog(image: np.ndarray, calibration_data: dict[str, Any]) -> CVResult:
     center_data = calibration_data.get("center")
     min_point_data = calibration_data.get("min_point")
@@ -169,40 +238,65 @@ def _recognize_analog(image: np.ndarray, calibration_data: dict[str, Any]) -> CV
     min_point = (float(min_point_data["x"]), float(min_point_data["y"]))
     max_point = (float(max_point_data["x"]), float(max_point_data["y"]))
 
+    expected_len = (
+        math.hypot(min_point[0] - center[0], min_point[1] - center[1])
+        + math.hypot(max_point[0] - center[0], max_point[1] - center[1])
+    ) / 2.0
+    near_center_thr = max(18.0, expected_len * 0.25)
+    min_tip_len = max(24.0, expected_len * 0.35)
+
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     gray = cv2.GaussianBlur(gray, (5, 5), 0)
-    edges = cv2.Canny(gray, 80, 160)
-    lines = cv2.HoughLinesP(edges, 1, np.pi / 180, threshold=50, minLineLength=30, maxLineGap=12)
+
+    lines: Any = None
+    for low, high, hough_thr in ((60, 140, 40), (80, 160, 45), (100, 200, 50)):
+        edges = cv2.Canny(gray, low, high)
+        lines = cv2.HoughLinesP(
+            edges,
+            1,
+            np.pi / 180,
+            threshold=hough_thr,
+            minLineLength=max(24, int(round(expected_len * 0.25))),
+            maxLineGap=14,
+        )
+        if lines is not None:
+            break
     if lines is None:
         return CVResult(value=None, ok=False, error="Needle detection failed")
 
     best_tip: tuple[float, float] | None = None
-    best_dist = -1.0
+    best_score = -1.0
     for item in lines:
         x1, y1, x2, y2 = item[0]
         p1 = (float(x1), float(y1))
         p2 = (float(x2), float(y2))
-        d1 = (p1[0] - center[0]) ** 2 + (p1[1] - center[1]) ** 2
-        d2 = (p2[0] - center[0]) ** 2 + (p2[1] - center[1]) ** 2
-        near_center = min(d1, d2) < 45**2
-        if not near_center:
+        d1 = math.hypot(p1[0] - center[0], p1[1] - center[1])
+        d2 = math.hypot(p2[0] - center[0], p2[1] - center[1])
+        center_to_segment = _point_to_segment_distance(center, p1, p2)
+        if center_to_segment > near_center_thr:
             continue
         tip = p1 if d1 > d2 else p2
-        dist = max(d1, d2)
-        if dist > best_dist:
+        tip_len = max(d1, d2)
+        if tip_len < min_tip_len:
+            continue
+        # Предпочитаем длинные линии, проходящие ближе к центру.
+        score = tip_len - center_to_segment * 0.8
+        if score > best_score:
             best_tip = tip
-            best_dist = dist
+            best_score = score
 
+    if best_tip is None:
+        best_tip = _estimate_tip_from_dark_pixels(image, center, expected_len)
     if best_tip is None:
         return CVResult(value=None, ok=False, error="Needle near center not found")
 
     angle = _angle_from_center(center, best_tip)
     min_angle = _angle_from_center(center, min_point)
     max_angle = _angle_from_center(center, max_point)
-    span = max_angle - min_angle
+    span = _angle_delta_deg(min_angle, max_angle)
     if abs(span) < 1e-4:
         return CVResult(value=None, ok=False, error="Invalid calibration angle span")
-    ratio = (angle - min_angle) / span
+    ratio = _angle_delta_deg(min_angle, angle) / span
     ratio = min(1.0, max(0.0, ratio))
     value = float(min_value) + ratio * (float(max_value) - float(min_value))
     return CVResult(value=value, ok=True)
