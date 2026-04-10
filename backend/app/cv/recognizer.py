@@ -185,6 +185,77 @@ def _angle_delta_deg(start: float, end: float) -> float:
     return d
 
 
+def _angle_diff_deg(a: float, b: float) -> float:
+    d = abs(a - b) % 360.0
+    return min(d, 360.0 - d)
+
+
+def _complement_span_deg(span_short: float) -> float:
+    """Вторая дуга между теми же min/max: кратчайшая span_short, дополнительная = 360-|short| с тем же знаком направления."""
+    if span_short > 0:
+        return span_short - 360.0
+    if span_short < 0:
+        return span_short + 360.0
+    return 0.0
+
+
+def _ratio_on_arc(min_angle: float, max_angle: float, tip_angle: float) -> tuple[float, float, str]:
+    """Интерполяция угла стрелки в ratio [0, 1] между min и max по кругу.
+
+    Между min и max есть две дуги: короткая (до 180°) и длинная (360° - |short|).
+    Для каждой дуги вычисляем свою дельту и ratio.
+
+    Ключевой момент: для длинной дуги нельзя использовать _angle_delta_deg (даёт
+    кратчайший путь). Когда стрелка переходит через 180°-рубеж относительно min,
+    кратчайшая дельта меняет знак — но реальная дуга продолжается в том же направлении.
+
+    Правило:
+    - Если sign(delta_short) совпадает с sign(span_long) — дельта вдоль длинной дуги
+      равна delta_short (начало дуги, направление совпадает).
+    - Иначе — противоположное: delta_long = complement(delta_short) = delta_short ± 360°.
+    """
+    span_short = _angle_delta_deg(min_angle, max_angle)
+    if abs(span_short) < 1e-6:
+        return 0.0, 0.0, "degenerate"
+
+    span_long = _complement_span_deg(span_short)
+    delta_short = _angle_delta_deg(min_angle, tip_angle)
+
+    # Дельта вдоль длинной дуги: совпадает с delta_short по знаку с span_long
+    # только на первой половине дуги; после перехода через ±180° знак delta_short
+    # меняется — тогда берём дополнение (± 360°).
+    if abs(span_long) < 1e-6:
+        delta_long = delta_short
+    elif span_long * delta_short >= 0:
+        # delta_short идёт в том же направлении, что и длинная дуга
+        delta_long = delta_short
+    else:
+        # delta_short идёт «против» длинной дуги — нужна противоположная дуга до tip
+        delta_long = _complement_span_deg(delta_short)
+
+    r_short = delta_short / span_short
+    r_long = delta_long / span_long
+
+    eps = 0.02
+    short_ok = -eps <= r_short <= 1.0 + eps
+    long_ok = -eps <= r_long <= 1.0 + eps
+
+    if short_ok and not long_ok:
+        return min(1.0, max(0.0, r_short)), span_short, "short_arc"
+    if long_ok and not short_ok:
+        return min(1.0, max(0.0, r_long)), span_long, "long_arc"
+    if short_ok and long_ok:
+        # Обе дуги допустимы (стрелка очень близко к min): предпочитаем длинную для
+        # типичного манометра (шкала через верх), или короткую если short > long.
+        if abs(span_long) > abs(span_short):
+            return min(1.0, max(0.0, r_long)), span_long, "long_arc"
+        return min(1.0, max(0.0, r_short)), span_short, "short_arc"
+
+    # Ни одна дуга (угол совсем снаружи): проецируем на ту, к которой ближе.
+    r = min(1.0, max(0.0, r_short))
+    return r, span_short, "short_clamped"
+
+
 def _estimate_tip_from_dark_pixels(
     image: np.ndarray,
     center: tuple[float, float],
@@ -223,6 +294,143 @@ def _estimate_tip_from_dark_pixels(
     return float(pts_x[idx]), float(pts_y[idx])
 
 
+def _radial_darkness_mean(
+    gray: np.ndarray,
+    center: tuple[float, float],
+    r0: float,
+    r1: float,
+    angle_deg: float,
+) -> float:
+    """Средняя «тёмность» (255 − яркость) вдоль луча — стрелка даёт пик.
+
+    Важно: угол angle_deg совпадает с соглашением _angle_from_center, где
+    dy = center_y - point_y (ось Y математическая, «вверх» = +). Поэтому для
+    перевода в пиксельные координаты OpenCV ось Y нужно ИНВЕРТИРОВАТЬ:
+        py = center[1] - sin(angle)*r    (НЕ +sin, иначе сканирование идёт в зеркальном направлении)
+    """
+    rad = math.radians(angle_deg)
+    dx_dir = math.cos(rad)
+    dy_dir = -math.sin(rad)   # инверсия Y: в image coords y увеличивается вниз
+    s = 0.0
+    n = 0
+    steps = max(10, int((r1 - r0) / 2.5))
+    for i in range(steps + 1):
+        t = i / max(steps, 1)
+        r = r0 + t * (r1 - r0)
+        px = int(round(center[0] + dx_dir * r))
+        py = int(round(center[1] + dy_dir * r))
+        if 0 <= px < gray.shape[1] and 0 <= py < gray.shape[0]:
+            s += 255.0 - float(gray[py, px])
+            n += 1
+    return s / max(n, 1e-6)
+
+
+def _best_angle_radial_darkness(
+    gray: np.ndarray,
+    center: tuple[float, float],
+    r0: float,
+    r1: float,
+    min_angle: float,
+    max_angle: float,
+) -> tuple[float, float]:
+    """Угол с максимальной тёмностью на луче; ослабляем засечки у min/max."""
+    scores = np.zeros(360, dtype=np.float64)
+    for a in range(360):
+        scores[a] = _radial_darkness_mean(gray, center, r0, r1, float(a))
+        # Засечки и метки у 0 и 100 создают ложные пики — подавляем шире (±20°).
+        if _angle_diff_deg(float(a), min_angle) < 20.0 or _angle_diff_deg(float(a), max_angle) < 20.0:
+            scores[a] *= 0.30
+    smoothed = np.convolve(scores, np.ones(5, dtype=np.float64) / 5.0, mode="same")
+    best_i = int(np.argmax(smoothed))
+    peak = float(smoothed[best_i])
+    # Уточнение по соседним углам (шаг 0.25°)
+    best_f = float(best_i)
+    for _ in range(2):
+        left = _radial_darkness_mean(gray, center, r0, r1, best_f - 0.25)
+        right = _radial_darkness_mean(gray, center, r0, r1, best_f + 0.25)
+        if left > right and left > peak:
+            best_f -= 0.25
+            peak = left
+        elif right > peak:
+            best_f += 0.25
+            peak = right
+        else:
+            break
+    return best_f, peak
+
+
+def _detect_analog_needle_tip(
+    image: np.ndarray,
+    center: tuple[float, float],
+    min_point: tuple[float, float],
+    max_point: tuple[float, float],
+    expected_len: float,
+    near_center_thr: float,
+    min_tip_len: float,
+    lines: Any,
+) -> tuple[tuple[float, float], float, str, dict[str, Any]]:
+    """Hough + согласование с радиальным пиком тёмности (устойчиво к засечкам у 0/100)."""
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    gray = cv2.GaussianBlur(gray, (5, 5), 0)
+    min_angle = _angle_from_center(center, min_point)
+    max_angle = _angle_from_center(center, max_point)
+    r0 = max(12.0, expected_len * 0.18)
+    r1 = max(r0 + 8.0, expected_len * 1.02)
+    rad_angle, rad_peak = _best_angle_radial_darkness(gray, center, r0, r1, min_angle, max_angle)
+
+    debug: dict[str, Any] = {
+        "radial_peak_angle": round(float(rad_angle), 3),
+        "radial_peak_strength": round(float(rad_peak), 4),
+    }
+
+    mismatch_penalty_per_deg = 1.2
+    best_tip: tuple[float, float] | None = None
+    best_score = -1e18
+    line_count = 0
+
+    if lines is not None:
+        line_count = int(len(lines))
+        for item in lines:
+            x1, y1, x2, y2 = item[0]
+            p1 = (float(x1), float(y1))
+            p2 = (float(x2), float(y2))
+            d1 = math.hypot(p1[0] - center[0], p1[1] - center[1])
+            d2 = math.hypot(p2[0] - center[0], p2[1] - center[1])
+            center_to_segment = _point_to_segment_distance(center, p1, p2)
+            if center_to_segment > near_center_thr:
+                continue
+            tip = p1 if d1 > d2 else p2
+            tip_len = max(d1, d2)
+            if tip_len < min_tip_len:
+                continue
+            tip_ang = _angle_from_center(center, tip)
+            mismatch = _angle_diff_deg(tip_ang, rad_angle)
+            score = tip_len - center_to_segment * 0.8 - mismatch * mismatch_penalty_per_deg
+            if score > best_score:
+                best_score = score
+                best_tip = tip
+
+    ray_len = max(min_tip_len, expected_len * 0.88)
+    # ray_tip в пиксельных координатах: Y инвертирован (см. _radial_darkness_mean).
+    ray_tip = (
+        center[0] + math.cos(math.radians(rad_angle)) * ray_len,
+        center[1] - math.sin(math.radians(rad_angle)) * ray_len,
+    )
+    ray_base_score = rad_peak * 0.35
+
+    if best_tip is None:
+        debug["needle_method"] = "radial_only"
+        return ray_tip, ray_base_score, "radial_only", debug
+
+    tip_ang = _angle_from_center(center, best_tip)
+    if _angle_diff_deg(tip_ang, rad_angle) > 22.0:
+        debug["needle_method"] = "radial_override_far_hough"
+        return ray_tip, ray_base_score, "radial_override_far_hough", debug
+
+    debug["needle_method"] = "hough_radial_agree"
+    return best_tip, float(best_score), "hough_radial_agree", debug
+
+
 def _recognize_analog(image: np.ndarray, calibration_data: dict[str, Any]) -> CVResult:
     center_data = calibration_data.get("center")
     min_point_data = calibration_data.get("min_point")
@@ -256,48 +464,30 @@ def _recognize_analog(image: np.ndarray, calibration_data: dict[str, Any]) -> CV
             1,
             np.pi / 180,
             threshold=hough_thr,
-            minLineLength=max(24, int(round(expected_len * 0.25))),
-            maxLineGap=14,
+            minLineLength=max(28, int(round(expected_len * 0.28))),
+            maxLineGap=12,
         )
         if lines is not None:
             break
-    if lines is None:
-        return CVResult(value=None, ok=False, error="Needle detection failed")
 
-    best_tip: tuple[float, float] | None = None
-    best_score = -1.0
-    for item in lines:
-        x1, y1, x2, y2 = item[0]
-        p1 = (float(x1), float(y1))
-        p2 = (float(x2), float(y2))
-        d1 = math.hypot(p1[0] - center[0], p1[1] - center[1])
-        d2 = math.hypot(p2[0] - center[0], p2[1] - center[1])
-        center_to_segment = _point_to_segment_distance(center, p1, p2)
-        if center_to_segment > near_center_thr:
-            continue
-        tip = p1 if d1 > d2 else p2
-        tip_len = max(d1, d2)
-        if tip_len < min_tip_len:
-            continue
-        # Предпочитаем длинные линии, проходящие ближе к центру.
-        score = tip_len - center_to_segment * 0.8
-        if score > best_score:
-            best_tip = tip
-            best_score = score
-
-    if best_tip is None:
-        best_tip = _estimate_tip_from_dark_pixels(image, center, expected_len)
+    best_tip, _score, needle_method, _ = _detect_analog_needle_tip(
+        image, center, min_point, max_point, expected_len, near_center_thr, min_tip_len, lines
+    )
+    if needle_method == "radial_only":
+        fb = _estimate_tip_from_dark_pixels(image, center, expected_len)
+        if fb is not None and _angle_diff_deg(
+            _angle_from_center(center, fb), _angle_from_center(center, best_tip)
+        ) < 12.0:
+            best_tip = fb
     if best_tip is None:
         return CVResult(value=None, ok=False, error="Needle near center not found")
 
     angle = _angle_from_center(center, best_tip)
     min_angle = _angle_from_center(center, min_point)
     max_angle = _angle_from_center(center, max_point)
-    span = _angle_delta_deg(min_angle, max_angle)
-    if abs(span) < 1e-4:
+    ratio, _span_used, arc_hint = _ratio_on_arc(min_angle, max_angle, angle)
+    if arc_hint == "degenerate":
         return CVResult(value=None, ok=False, error="Invalid calibration angle span")
-    ratio = _angle_delta_deg(min_angle, angle) / span
-    ratio = min(1.0, max(0.0, ratio))
     value = float(min_value) + ratio * (float(max_value) - float(min_value))
     return CVResult(value=value, ok=True)
 
@@ -311,6 +501,9 @@ def analog_debug_from_image(image: np.ndarray, calibration_data: dict[str, Any])
         "max_angle": None,
         "ratio": None,
         "quality_score": None,
+        "radial_peak_angle": None,
+        "radial_peak_strength": None,
+        "needle_method": None,
         "warnings": [],
     }
 
@@ -344,58 +537,50 @@ def analog_debug_from_image(image: np.ndarray, calibration_data: dict[str, Any])
             1,
             np.pi / 180,
             threshold=hough_thr,
-            minLineLength=max(24, int(round(expected_len * 0.25))),
-            maxLineGap=14,
+            minLineLength=max(28, int(round(expected_len * 0.28))),
+            maxLineGap=12,
         )
         if lines is not None:
             break
 
-    best_tip: tuple[float, float] | None = None
-    best_score = -1.0
-    line_count = 0
-    if lines is not None:
-        line_count = int(len(lines))
-        for item in lines:
-            x1, y1, x2, y2 = item[0]
-            p1 = (float(x1), float(y1))
-            p2 = (float(x2), float(y2))
-            d1 = math.hypot(p1[0] - center[0], p1[1] - center[1])
-            d2 = math.hypot(p2[0] - center[0], p2[1] - center[1])
-            center_to_segment = _point_to_segment_distance(center, p1, p2)
-            if center_to_segment > near_center_thr:
-                continue
-            tip = p1 if d1 > d2 else p2
-            tip_len = max(d1, d2)
-            if tip_len < min_tip_len:
-                continue
-            score = tip_len - center_to_segment * 0.8
-            if score > best_score:
-                best_tip = tip
-                best_score = score
+    line_count = int(len(lines)) if lines is not None else 0
+    best_tip, best_score, needle_method, ndbg = _detect_analog_needle_tip(
+        image, center, min_point, max_point, expected_len, near_center_thr, min_tip_len, lines
+    )
+    out["radial_peak_angle"] = ndbg.get("radial_peak_angle")
+    out["radial_peak_strength"] = ndbg.get("radial_peak_strength")
+    out["needle_method"] = needle_method
+    out["quality_score"] = round(float(best_score), 3)
+
+    if needle_method == "radial_only":
+        fb = _estimate_tip_from_dark_pixels(image, center, expected_len)
+        if fb is not None and _angle_diff_deg(
+            _angle_from_center(center, fb), _angle_from_center(center, best_tip)
+        ) < 12.0:
+            best_tip = fb
+            out["warnings"] = [*out["warnings"], "tip_refined_dark_agree"]
+    if needle_method == "radial_override_far_hough":
+        out["warnings"] = [*out["warnings"], "hough_disagreed_with_radial"]
 
     if best_tip is None:
-        best_tip = _estimate_tip_from_dark_pixels(image, center, expected_len)
-        if best_tip is None:
-            out["warnings"] = ["needle_not_found", f"hough_lines={line_count}"]
-            return out
-        out["warnings"] = ["tip_from_dark_pixels_fallback"]
-    else:
-        out["quality_score"] = round(float(best_score), 3)
+        out["warnings"] = [*out["warnings"], "needle_not_found", f"hough_lines={line_count}"]
+        return out
 
     angle = _angle_from_center(center, best_tip)
     min_angle = _angle_from_center(center, min_point)
     max_angle = _angle_from_center(center, max_point)
-    span = _angle_delta_deg(min_angle, max_angle)
-    if abs(span) < 1e-4:
-        out["warnings"] = ["invalid_calibration_angle_span"]
+    ratio, span_used, arc_hint = _ratio_on_arc(min_angle, max_angle, angle)
+    if arc_hint == "degenerate":
+        out["warnings"] = [*out["warnings"], "invalid_calibration_angle_span"]
         return out
-    ratio = _angle_delta_deg(min_angle, angle) / span
     out["tip_point"] = {"x": round(float(best_tip[0]), 2), "y": round(float(best_tip[1]), 2)}
     out["angle"] = round(float(angle), 3)
     out["min_angle"] = round(float(min_angle), 3)
     out["max_angle"] = round(float(max_angle), 3)
     out["ratio"] = round(float(ratio), 5)
-    if ratio < -0.03 or ratio > 1.03:
+    out["span_deg"] = round(float(span_used), 3)
+    out["arc"] = arc_hint
+    if arc_hint == "short_clamped":
         out["warnings"] = [*out["warnings"], "tip_outside_minmax_span"]
     return out
 
