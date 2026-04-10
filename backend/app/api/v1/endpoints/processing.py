@@ -14,7 +14,12 @@ from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
-from app.cv.recognizer import analog_debug_from_image, recognize_from_image
+from app.cv.recognizer import (
+    _calibration_to_roi_coords,
+    _roi_origin,
+    analog_debug_from_image,
+    recognize_from_image,
+)
 from app.models.logger import GaugeType
 from app.db.session import get_db_session
 from app.processing.pipeline import (
@@ -43,6 +48,10 @@ class TestRecognizeRequest(BaseModel):
     roi_json: str | None = Field(
         default=None,
         description="Подмена roi_json для этого запроса (совпадает с рамкой в UI, в т.ч. до Save config).",
+    )
+    calibration_json: str | None = Field(
+        default=None,
+        description="Подмена calibration_json (center/min/max и шкала) — должна совпадать с UI; иначе берётся из БД.",
     )
 
 
@@ -158,7 +167,17 @@ async def api_test_recognize(
         if image is None:
             raise RuntimeError("Failed to decode captured frame")
 
-        cv_result = recognize_from_image(image, target, roi_json_override=body.roi_json)
+        cal_override = (
+            body.calibration_json.strip()
+            if body.calibration_json is not None and body.calibration_json.strip()
+            else None
+        )
+        cv_result = recognize_from_image(
+            image,
+            target,
+            roi_json_override=body.roi_json,
+            calibration_json_override=cal_override,
+        )
 
         # Для интерактивной настройки ROI возвращаем вырезанный ROI всегда,
         # даже если распознавание не удалось.
@@ -184,8 +203,10 @@ async def api_test_recognize(
 
         analog_debug: dict[str, Any] | None = None
         if target.gauge_type == GaugeType.analog:
-            calibration_data = _parse_json(target.calibration_json)
-            analog_debug = analog_debug_from_image(roi_image, calibration_data)
+            calibration_data = _parse_json(cal_override if cal_override is not None else target.calibration_json)
+            rx, ry = _roi_origin(roi_data)
+            cal_roi = _calibration_to_roi_coords(calibration_data, rx, ry)
+            analog_debug = analog_debug_from_image(roi_image, cal_roi)
 
         return {
             "value": cv_result.value,

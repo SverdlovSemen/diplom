@@ -47,6 +47,8 @@ export type TestRecognizeResult = {
 export type TestRecognizeBody = {
   frame_jpeg_base64?: string;
   roi_json?: string;
+  /** Должен совпадать с полем Calibration в UI (center/min/max), иначе бэкенд возьмёт калибровку из БД. */
+  calibration_json?: string;
 };
 
 export async function testRecognize(loggerId: string, body?: TestRecognizeBody): Promise<TestRecognizeResult> {

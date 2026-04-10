@@ -85,6 +85,12 @@ function safeParseCalibrationJson(value: string): CalibrationData | null {
   }
 }
 
+/** backend возвращает tip_point в координатах вырезанного ROI; оверлей на полном snapshot — в координатах всего кадра. */
+function tipPointToFullImage(tip: { x: number; y: number }, roi: RoiRect | null): { x: number; y: number } {
+  if (!roi) return { x: tip.x, y: tip.y };
+  return { x: tip.x + roi.x, y: tip.y + roi.y };
+}
+
 export function LoggerSetupPage(): React.ReactElement {
   const { loggerId } = useParams();
   const [gaugeType, setGaugeType] = React.useState<GaugeType>("analog");
@@ -191,6 +197,8 @@ export function LoggerSetupPage(): React.ReactElement {
     let cancelled = false;
     let createdBlobUrl: string | null = null;
     const url = `${apiBase}/api/v1/processing/loggers/${loggerId}/snapshot?ts=${snapshotTs}`;
+    setTestResult(null);
+    setQualitySummary(null);
     setSnapshotLoading(true);
     setSnapshotLoadError(null);
     setSnapshotObjectUrl((prev) => {
@@ -259,6 +267,8 @@ export function LoggerSetupPage(): React.ReactElement {
       w: Math.round(rect.w),
       h: Math.round(rect.h),
     };
+    setTestResult(null);
+    setQualitySummary(null);
     setRoiJson(JSON.stringify(next));
     setRoiRect(next);
   }
@@ -371,6 +381,7 @@ export function LoggerSetupPage(): React.ReactElement {
       const r = await testRecognize(loggerId, {
         frame_jpeg_base64,
         roi_json: roiJson,
+        calibration_json: gaugeType === "analog" ? calibrationJson : undefined,
       });
       setTestResult(r);
       let line = r.ok ? `Recognized: ${r.value ?? "n/a"}` : `Recognize error: ${r.error ?? "unknown"}`;
@@ -392,8 +403,8 @@ export function LoggerSetupPage(): React.ReactElement {
 
   async function runQualityTestSeries(samples = 6): Promise<void> {
     if (!loggerId) return;
-    if (gaugeType === "analog" && (!calibrationReady || !configSaved)) {
-      setError("Finish ROI + center/min/max + scale values, then Save config before quality test");
+    if (gaugeType === "analog" && !calibrationReady) {
+      setError("Finish ROI + center/min/max + scale values (ROI must match saved frame if you changed ROI)");
       return;
     }
     setQualityRunning(true);
@@ -406,7 +417,10 @@ export function LoggerSetupPage(): React.ReactElement {
       let failCount = 0;
       const notes = new Set<string>();
       for (let i = 0; i < samples; i += 1) {
-        const r = await testRecognize(loggerId, { roi_json: roiJson });
+        const r = await testRecognize(loggerId, {
+          roi_json: roiJson,
+          calibration_json: calibrationJson,
+        });
         if (r.ok && typeof r.value === "number" && Number.isFinite(r.value)) {
           values.push(r.value);
           okCount += 1;
@@ -464,12 +478,17 @@ export function LoggerSetupPage(): React.ReactElement {
             <button
               className="rounded border px-3 py-2 text-sm"
               onClick={() => void runTestRecognize()}
-              disabled={testing || (gaugeType === "analog" && (!calibrationReady || !configSaved))}
+              disabled={
+                testing ||
+                snapshotLoading ||
+                !snapshotObjectUrl ||
+                (gaugeType === "analog" && !calibrationReady)
+              }
             >
               {testing ? "Testing…" : "Test recognize"}
             </button>
             {gaugeType === "analog" ? (
-              <button className="rounded border px-3 py-2 text-sm" onClick={() => void runQualityTestSeries(6)} disabled={qualityRunning || !calibrationReady || !configSaved}>
+              <button className="rounded border px-3 py-2 text-sm" onClick={() => void runQualityTestSeries(6)} disabled={qualityRunning || !calibrationReady}>
                 {qualityRunning ? "Quality…" : "Quality x6"}
               </button>
             ) : null}
@@ -622,8 +641,10 @@ export function LoggerSetupPage(): React.ReactElement {
               const sy = r.height / imgDims.h;
               const tip = testResult.analog_debug?.tip_point;
               if (!tip) return null;
-              const left = tip.x * sx - 5;
-              const top = tip.y * sy - 5;
+              const roi = roiRect ?? safeParseRoiJson(roiJson);
+              const tipFull = tipPointToFullImage(tip, roi);
+              const left = tipFull.x * sx - 5;
+              const top = tipFull.y * sy - 5;
               return <div className="absolute h-2.5 w-2.5 rounded-full bg-emerald-600" style={{ left, top }} title="detected tip" />;
             })()
           ) : null}
@@ -633,7 +654,9 @@ export function LoggerSetupPage(): React.ReactElement {
               const r = img.getBoundingClientRect();
               const sx = r.width / imgDims.w;
               const sy = r.height / imgDims.h;
-              const tip = testResult?.analog_debug?.tip_point ?? null;
+              const tipRaw = testResult?.analog_debug?.tip_point ?? null;
+              const roi = roiRect ?? safeParseRoiJson(roiJson);
+              const tip = tipRaw ? tipPointToFullImage(tipRaw, roi) : null;
               const hasAnyLine = (centerPoint && minPoint) || (centerPoint && maxPoint) || (centerPoint && tip);
               if (!hasAnyLine) return null;
               const cx = centerPoint ? centerPoint.x * sx : null;

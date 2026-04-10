@@ -35,6 +35,46 @@ def _apply_roi(image: np.ndarray, roi_data: dict[str, Any]) -> np.ndarray:
     return image[max(0, y) : min(image.shape[0], y2), max(0, x) : min(image.shape[1], x2)]
 
 
+def _roi_origin(roi_data: dict[str, Any]) -> tuple[int, int]:
+    """Левый верхний угол ROI в координатах полного кадра (как в _apply_roi)."""
+    if not roi_data:
+        return 0, 0
+    return int(roi_data.get("x", 0)), int(roi_data.get("y", 0))
+
+
+def _calibration_to_roi_coords(calibration_data: dict[str, Any], roi_x: int, roi_y: int) -> dict[str, Any]:
+    """Переводит center/min_point/max_point из координат полного кадра в локальные координаты roi_image."""
+    if roi_x == 0 and roi_y == 0:
+        return dict(calibration_data)
+    out: dict[str, Any] = dict(calibration_data)
+    for key in ("center", "min_point", "max_point"):
+        pt = calibration_data.get(key)
+        if isinstance(pt, dict) and "x" in pt and "y" in pt:
+            out[key] = {"x": float(pt["x"]) - roi_x, "y": float(pt["y"]) - roi_y}
+    return out
+
+
+def _append_calibration_roi_warnings(out_warnings: list[str], calibration_data: dict[str, Any], roi_w: int, roi_h: int) -> None:
+    """Если точка калибровки явно вне вырезанного ROI — помечаем (погрешность округления ±2 px)."""
+    margin = 2.0
+    for key in ("center", "min_point", "max_point"):
+        pt = calibration_data.get(key)
+        if not isinstance(pt, dict):
+            continue
+        try:
+            px, py = float(pt["x"]), float(pt["y"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if (
+            px < -margin
+            or py < -margin
+            or px > roi_w + margin
+            or py > roi_h + margin
+        ):
+            out_warnings.append(f"calibration_{key}_outside_roi")
+            break
+
+
 def _recognize_digital(image: np.ndarray) -> CVResult:
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     h, w = gray.shape[:2]
@@ -517,6 +557,8 @@ def analog_debug_from_image(image: np.ndarray, calibration_data: dict[str, Any])
     center = (float(center_data["x"]), float(center_data["y"]))
     min_point = (float(min_point_data["x"]), float(min_point_data["y"]))
     max_point = (float(max_point_data["x"]), float(max_point_data["y"]))
+    roi_h, roi_w = image.shape[:2]
+    _append_calibration_roi_warnings(out["warnings"], calibration_data, roi_w, roi_h)
     expected_len = (
         math.hypot(min_point[0] - center[0], min_point[1] - center[1])
         + math.hypot(max_point[0] - center[0], max_point[1] - center[1])
@@ -585,13 +627,26 @@ def analog_debug_from_image(image: np.ndarray, calibration_data: dict[str, Any])
     return out
 
 
-def recognize_from_image(image: np.ndarray, logger: Logger, *, roi_json_override: str | None = None) -> CVResult:
+def recognize_from_image(
+    image: np.ndarray,
+    logger: Logger,
+    *,
+    roi_json_override: str | None = None,
+    calibration_json_override: str | None = None,
+) -> CVResult:
     roi_data = _parse_json(roi_json_override if roi_json_override is not None else logger.roi_json)
-    calibration_data = _parse_json(logger.calibration_json)
+    cal_raw = (
+        calibration_json_override.strip()
+        if calibration_json_override is not None and calibration_json_override.strip()
+        else None
+    )
+    calibration_data = _parse_json(cal_raw if cal_raw is not None else logger.calibration_json)
     roi_image = _apply_roi(image, roi_data)
     if roi_image.size == 0:
         return CVResult(value=None, ok=False, error="ROI produced empty image")
     if logger.gauge_type == GaugeType.digital:
         return _recognize_digital(roi_image)
-    return _recognize_analog(roi_image, calibration_data)
+    rx, ry = _roi_origin(roi_data)
+    cal_roi = _calibration_to_roi_coords(calibration_data, rx, ry)
+    return _recognize_analog(roi_image, cal_roi)
 
