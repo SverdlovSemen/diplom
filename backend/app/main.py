@@ -6,8 +6,9 @@ import asyncio
 from pathlib import Path
 import shutil
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy import text
 
@@ -16,7 +17,10 @@ from app.core.config import settings
 from app.core.logging import configure_logging
 from app.db.session import AsyncSessionLocal
 from app.ingest.rtmp_stat import get_active_stream_keys
+from app.models.user import UserRole
 from app.processing.pipeline import process_due_loggers
+from app.security.auth import decode_access_token
+from app.services.bootstrap_users import seed_users_if_missing
 
 
 configure_logging(settings.log_level)
@@ -40,6 +44,27 @@ Path(settings.storage_dir).mkdir(parents=True, exist_ok=True)
 app.mount("/media", StaticFiles(directory=settings.storage_dir), name="media")
 
 _worker_task: asyncio.Task[None] | None = None
+
+
+@app.middleware("http")
+async def media_auth_middleware(request: Request, call_next):
+    if not request.url.path.startswith("/media/"):
+        return await call_next(request)
+    token = request.query_params.get("access_token")
+    if not token:
+        auth = request.headers.get("authorization", "")
+        if auth.startswith("Bearer "):
+            token = auth.split(" ", 1)[1].strip()
+    if not token:
+        return JSONResponse(status_code=401, content={"detail": "Not authenticated"})
+    try:
+        payload = decode_access_token(token)
+        role = payload.get("role")
+        if role not in (UserRole.admin.value, UserRole.viewer.value):
+            return JSONResponse(status_code=403, content={"detail": "Insufficient permissions"})
+    except Exception:
+        return JSONResponse(status_code=401, content={"detail": "Invalid token"})
+    return await call_next(request)
 
 
 @app.get("/healthz")
@@ -82,6 +107,11 @@ async def readyz() -> dict[str, object]:
 async def on_startup() -> None:
     logger.info("Starting app", extra={"env": settings.env})
     global _worker_task
+    try:
+        async with AsyncSessionLocal() as session:
+            await seed_users_if_missing(session)
+    except Exception:
+        logger.exception("User bootstrap failed")
 
     async def _processing_worker() -> None:
         while True:

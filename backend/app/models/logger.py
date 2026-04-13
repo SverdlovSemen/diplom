@@ -16,6 +16,11 @@ class GaugeType(str, enum.Enum):
     digital = "digital"
 
 
+class CaptureMode(str, enum.Enum):
+    continuous = "continuous"
+    schedule = "schedule"
+
+
 class Logger(Base):
     __tablename__ = "loggers"
 
@@ -36,10 +41,25 @@ class Logger(Base):
 
     sample_interval_sec: Mapped[int] = mapped_column(Integer, nullable=False, default=5)
     enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    capture_mode: Mapped[CaptureMode] = mapped_column(
+        Enum(CaptureMode, name="capture_mode"),
+        nullable=False,
+        default=CaptureMode.continuous,
+    )
+    # Для режима schedule: окно активности в UTC-часах [start, end), поддерживает переход через полночь.
+    schedule_start_hour_utc: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    schedule_end_hour_utc: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Политика хранения JPEG: удалять файлы старше N дней (сохраняем запись measurement, image_path очищаем).
+    image_retention_days: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
     # ROI и калибровка (на этапе скелета — JSON-строки; позже можно вынести в отдельные таблицы/JSONB)
     roi_json: Mapped[str | None] = mapped_column(String, nullable=True)
     calibration_json: Mapped[str | None] = mapped_column(String, nullable=True)
+
+    # Персистентное состояние видеопотока (переживает перезапуск backend; дополняет in-memory ingest)
+    last_stream_seen_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_stream_gap_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_ingest_error: Mapped[str | None] = mapped_column(String(512), nullable=True)
 
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import tempfile
@@ -13,16 +14,49 @@ from dataclasses import dataclass
 
 import cv2
 import httpx
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
 from app.cv.recognizer import recognize_from_image
+from app.cv.types import CVResult
 from app.models.logger import Logger
 from app.models.measurement import Measurement
-from app.services.loggers import get_logger, list_loggers
+from app.cv.config_readiness import logger_ready_for_automated_recognition
+from app.services.loggers import (
+    STREAM_GAP_THROTTLE_SEC,
+    get_logger,
+    list_loggers,
+    record_stream_gap,
+)
+
+# Повторная запись «конфиг не готов» в БД не чаще, чем раз в минуту при неизменной ошибке.
+CONFIG_INCOMPLETE_GAP_THROTTLE_SEC = 60.0
 from app.services.measurements import get_last_measurement_for_logger
 
 logger = logging.getLogger("app.processing")
+_last_retention_cleanup_at: datetime | None = None
+_RETENTION_CLEANUP_PERIOD_SEC = 300
+_RETENTION_BATCH_SIZE = 500
+
+
+def _out_of_range_for_logger(target: Logger, value: float | None) -> bool | None:
+    """None — границы в логере не заданы или значения нет; True — вне [min,max]; False — внутри."""
+    if value is None:
+        return None
+    lo, hi = target.min_value, target.max_value
+    if lo is None or hi is None:
+        return None
+    v = float(value)
+    a, b = (float(lo), float(hi)) if lo <= hi else (float(hi), float(lo))
+    return not (a <= v <= b)
+
+
+def _cv_warnings_json(cv_result: CVResult) -> str | None:
+    if cv_result.warnings:
+        return json.dumps(cv_result.warnings)
+    return None
+
 
 # Повторы и fallback нужны: live RTMP из nginx-rtmp часто даёт ffmpeg «Input/output error» на первом коннекте.
 _FFMPEG_CAPTURE_RETRIES = 2
@@ -242,6 +276,9 @@ async def capture_frame_to_memory(stream_url: str, timeout: float = 42.0) -> byt
 
 async def process_logger_once(session: AsyncSession, logger_id: uuid.UUID) -> Measurement:
     target = await get_logger(session, logger_id)
+    ready, reason = logger_ready_for_automated_recognition(target)
+    if not ready:
+        raise RuntimeError(f"configuration_incomplete:{reason}")
     stream_url = f"{settings.rtmp_base_url.rstrip('/')}/{target.stream_key}"
     logger.info("Processing started", extra={"logger_id": str(target.id), "stream_key": target.stream_key})
     now = datetime.now(timezone.utc)
@@ -270,20 +307,35 @@ async def process_logger_once(session: AsyncSession, logger_id: uuid.UUID) -> Me
         unit=target.unit,
         ok=cv_result.ok,
         error=cv_result.error,
+        out_of_range=_out_of_range_for_logger(target, cv_result.value),
+        cv_warnings_json=_cv_warnings_json(cv_result),
         image_path=str(relative).replace("\\", "/"),
         captured_at=now,
     )
     session.add(measurement)
+    target.last_stream_seen_at = now
+    target.last_ingest_error = None
     await session.commit()
     await session.refresh(measurement)
     logger.info(
         "Processing completed",
-        extra={"logger_id": str(target.id), "ok": measurement.ok, "value": measurement.value},
+        extra={
+            "logger_id": str(target.id),
+            "ok": measurement.ok,
+            "value": measurement.value,
+            "out_of_range": measurement.out_of_range,
+        },
     )
     return measurement
 
 
 async def process_due_loggers(session: AsyncSession) -> int:
+    global _last_retention_cleanup_at
+    now = datetime.now(timezone.utc)
+    if _last_retention_cleanup_at is None or (now - _last_retention_cleanup_at).total_seconds() >= _RETENTION_CLEANUP_PERIOD_SEC:
+        await cleanup_expired_images(session, now=now)
+        _last_retention_cleanup_at = now
+
     items = await list_loggers(session, offset=0, limit=1000)
     # Один запрос к nginx /stat для всех логгеров — пропускаем те, у кого нет publisher'а.
     # Без этого каждый неактивный логгер тратит 8s+8s+20s = ~36s на ffmpeg+OpenCV timeout.
@@ -292,17 +344,92 @@ async def process_due_loggers(session: AsyncSession) -> int:
     for item in items:
         if not item.enabled:
             continue
+        if not _logger_schedule_allows_capture(item, now):
+            continue
         last = await get_last_measurement_for_logger(session, item.id)
         if last is not None and last.captured_at is not None:
             if datetime.now(timezone.utc) - last.captured_at < timedelta(seconds=item.sample_interval_sec):
                 continue
         if item.stream_key not in nginx_active:
             logger.debug("Skipping %s: no active publisher in nginx stat", item.stream_key)
+            await record_stream_gap(
+                session,
+                item.id,
+                "no_active_publisher",
+                throttle_sec=STREAM_GAP_THROTTLE_SEC,
+                last_gap_at=item.last_stream_gap_at,
+                last_recorded_error=item.last_ingest_error,
+            )
+            continue
+        ready, reason = logger_ready_for_automated_recognition(item)
+        if not ready:
+            logger.debug("Skipping %s: configuration not ready (%s)", item.stream_key, reason)
+            await record_stream_gap(
+                session,
+                item.id,
+                f"configuration_incomplete:{reason}",
+                throttle_sec=CONFIG_INCOMPLETE_GAP_THROTTLE_SEC,
+                last_gap_at=item.last_stream_gap_at,
+                last_recorded_error=item.last_ingest_error,
+            )
             continue
         try:
             await process_logger_once(session, item.id)
             processed += 1
         except Exception as e:
+            await record_stream_gap(
+                session,
+                item.id,
+                str(e)[:500],
+                throttle_sec=STREAM_GAP_THROTTLE_SEC,
+                last_gap_at=item.last_stream_gap_at,
+                last_recorded_error=item.last_ingest_error,
+            )
             logger.exception("Processing failed: %s", e, extra={"logger_id": str(item.id)})
     return processed
+
+
+def _logger_schedule_allows_capture(item: Logger, now: datetime) -> bool:
+    if getattr(item, "capture_mode", "continuous") == "continuous":
+        return True
+    start = item.schedule_start_hour_utc
+    end = item.schedule_end_hour_utc
+    if start is None or end is None:
+        return False
+    h = now.astimezone(timezone.utc).hour
+    if start == end:
+        return True
+    if start < end:
+        return start <= h < end
+    return h >= start or h < end
+
+
+async def cleanup_expired_images(session: AsyncSession, *, now: datetime) -> int:
+    stmt = (
+        select(Measurement, Logger.image_retention_days)
+        .join(Logger, Measurement.logger_id == Logger.id)
+        .where(Measurement.image_path.is_not(None), Logger.image_retention_days.is_not(None))
+        .order_by(Measurement.captured_at.asc())
+        .limit(_RETENTION_BATCH_SIZE)
+    )
+    rows = (await session.execute(stmt)).all()
+    removed = 0
+    for measurement, retention_days in rows:
+        if retention_days is None or retention_days <= 0:
+            continue
+        if measurement.captured_at is None:
+            continue
+        cutoff = measurement.captured_at + timedelta(days=int(retention_days))
+        if now < cutoff:
+            continue
+        rel = measurement.image_path
+        if rel:
+            path = Path(settings.storage_dir) / rel
+            path.unlink(missing_ok=True)
+        measurement.image_path = None
+        removed += 1
+    if removed > 0:
+        await session.commit()
+        logger.info("Retention cleanup removed images: %s", removed)
+    return removed
 

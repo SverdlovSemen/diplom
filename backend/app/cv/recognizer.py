@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import math
 import re
+from dataclasses import replace
 from typing import Any
 
 import cv2
@@ -52,6 +53,32 @@ def _calibration_to_roi_coords(calibration_data: dict[str, Any], roi_x: int, roi
         if isinstance(pt, dict) and "x" in pt and "y" in pt:
             out[key] = {"x": float(pt["x"]) - roi_x, "y": float(pt["y"]) - roi_y}
     return out
+
+
+def _append_roi_geometry_warnings(
+    out: list[str],
+    roi_image: np.ndarray,
+    roi_data: dict[str, Any],
+    full_shape: tuple[int, ...],
+) -> None:
+    """Слабые проверки ROI (вариант 1 ТЗ п.12: зона задаётся оператором, без авто-детектора прибора)."""
+    if roi_image.size == 0:
+        return
+    rh, rw = int(roi_image.shape[0]), int(roi_image.shape[1])
+    fh, fw = int(full_shape[0]), int(full_shape[1])
+    if rw < 5 or rh < 5:
+        out.append("roi_crop_below_min_geometry")
+    elif rw * rh < 2500:
+        out.append("roi_area_below_recommended")
+    if roi_data and fw > 0 and fh > 0 and rw * rh >= fw * fh * 0.98:
+        out.append("roi_covers_almost_entire_frame")
+
+
+def _merge_cv_warnings(result: CVResult, extra: list[str]) -> CVResult:
+    if not extra:
+        return result
+    merged = [*extra, *(result.warnings or [])]
+    return replace(result, warnings=merged)
 
 
 def _append_calibration_roi_warnings(out_warnings: list[str], calibration_data: dict[str, Any], roi_w: int, roi_h: int) -> None:
@@ -472,6 +499,10 @@ def _detect_analog_needle_tip(
 
 
 def _recognize_analog(image: np.ndarray, calibration_data: dict[str, Any]) -> CVResult:
+    warnings: list[str] = []
+    roi_h, roi_w = image.shape[:2]
+    _append_calibration_roi_warnings(warnings, calibration_data, roi_w, roi_h)
+
     center_data = calibration_data.get("center")
     min_point_data = calibration_data.get("min_point")
     max_point_data = calibration_data.get("max_point")
@@ -519,6 +550,9 @@ def _recognize_analog(image: np.ndarray, calibration_data: dict[str, Any]) -> CV
             _angle_from_center(center, fb), _angle_from_center(center, best_tip)
         ) < 12.0:
             best_tip = fb
+            warnings.append("tip_refined_dark_agree")
+    if needle_method == "radial_override_far_hough":
+        warnings.append("hough_disagreed_with_radial")
     if best_tip is None:
         return CVResult(value=None, ok=False, error="Needle near center not found")
 
@@ -528,8 +562,10 @@ def _recognize_analog(image: np.ndarray, calibration_data: dict[str, Any]) -> CV
     ratio, _span_used, arc_hint = _ratio_on_arc(min_angle, max_angle, angle)
     if arc_hint == "degenerate":
         return CVResult(value=None, ok=False, error="Invalid calibration angle span")
+    if arc_hint == "short_clamped":
+        warnings.append("tip_outside_minmax_span")
     value = float(min_value) + ratio * (float(max_value) - float(min_value))
-    return CVResult(value=value, ok=True)
+    return CVResult(value=value, ok=True, warnings=warnings or None)
 
 
 def analog_debug_from_image(image: np.ndarray, calibration_data: dict[str, Any]) -> dict[str, Any]:
@@ -634,6 +670,15 @@ def recognize_from_image(
     roi_json_override: str | None = None,
     calibration_json_override: str | None = None,
 ) -> CVResult:
+    """Единая точка входа CV для боевого пайплайна и проверки «как в проде».
+
+    Без подмены аргументов используются только ``logger.roi_json`` и ``logger.calibration_json`` (и
+    ``logger.gauge_type``). Интерактивная настройка в UI передаёт подмены через ``*_override`` до
+    сохранения в БД — после Save config путь совпадает с фоновой обработкой при том же кадре.
+
+    **Обнаружение прибора (ТЗ п.12, вариант 1):** границы прибора не ищутся автоматически; оператор
+    задаёт ROI. Слабые геометрические проверки после кропа — в ``_append_roi_geometry_warnings``.
+    """
     roi_data = _parse_json(roi_json_override if roi_json_override is not None else logger.roi_json)
     cal_raw = (
         calibration_json_override.strip()
@@ -644,9 +689,11 @@ def recognize_from_image(
     roi_image = _apply_roi(image, roi_data)
     if roi_image.size == 0:
         return CVResult(value=None, ok=False, error="ROI produced empty image")
+    roi_geom_warnings: list[str] = []
+    _append_roi_geometry_warnings(roi_geom_warnings, roi_image, roi_data, image.shape)
     if logger.gauge_type == GaugeType.digital:
-        return _recognize_digital(roi_image)
+        return _merge_cv_warnings(_recognize_digital(roi_image), roi_geom_warnings)
     rx, ry = _roi_origin(roi_data)
     cal_roi = _calibration_to_roi_coords(calibration_data, rx, ry)
-    return _recognize_analog(roi_image, cal_roi)
+    return _merge_cv_warnings(_recognize_analog(roi_image, cal_roi), roi_geom_warnings)
 

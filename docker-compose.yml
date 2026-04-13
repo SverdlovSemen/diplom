@@ -89,6 +89,14 @@ services:
       APP_PROCESSING_TICK_SEC: ${APP_PROCESSING_TICK_SEC:-1}
       APP_RTMP_BASE_URL: ${APP_RTMP_BASE_URL:-rtmp://nginx-rtmp:1935/live}
       APP_RTMP_STAT_URL: ${APP_RTMP_STAT_URL:-http://nginx-rtmp:8080/stat}
+      # Для экспорта CSV: абсолютные URL кадров; с хоста обычно http://localhost:8000
+      APP_PUBLIC_BASE_URL: ${APP_PUBLIC_BASE_URL:-http://localhost:8000}
+      APP_JWT_SECRET: ${APP_JWT_SECRET:-change-me-in-production}
+      APP_SEED_ADMIN_EMAIL: ${APP_SEED_ADMIN_EMAIL:-admin@example.com}
+      APP_SEED_ADMIN_PASSWORD: ${APP_SEED_ADMIN_PASSWORD:-admin123}
+      APP_SEED_VIEWER_ENABLED: ${APP_SEED_VIEWER_ENABLED:-true}
+      APP_SEED_VIEWER_EMAIL: ${APP_SEED_VIEWER_EMAIL:-viewer@example.com}
+      APP_SEED_VIEWER_PASSWORD: ${APP_SEED_VIEWER_PASSWORD:-viewer123}
     depends_on:
       postgres:
         condition: service_healthy

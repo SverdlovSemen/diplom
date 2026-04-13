@@ -7,15 +7,24 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.session import get_db_session
-from app.core.config import settings
-from app.schemas.logger import LoggerCreate, LoggerOut, LoggerStatus, LoggerUpdate, LoggerWithStatus
+from app.schemas.logger import (
+    BulkUpdateResult,
+    LoggerBulkMonitoringUpdate,
+    LoggerCreate,
+    LoggerOut,
+    LoggerStatus,
+    LoggerUpdate,
+    LoggerWithStatus,
+)
 from app.services.loggers import (
     LoggerConflictError,
     LoggerNotFoundError,
+    bulk_update_monitoring,
     create_logger,
     delete_logger,
     get_logger,
     list_loggers,
+    stream_unavailable_persisted,
     update_logger,
 )
 from app.services.measurements import get_last_measurement_for_logger
@@ -55,6 +64,7 @@ async def api_list_loggers(
             last_measurement_at=last.captured_at if last else None,
             last_ok=last.ok if last else None,
             last_error=last.error if last else None,
+            stream_unavailable_persisted=stream_unavailable_persisted(item),
         )
         base = LoggerOut.model_validate(item, from_attributes=True)
         out.append(LoggerWithStatus(**base.model_dump(), status=status_obj))
@@ -76,9 +86,23 @@ async def api_create_logger(
         ingest_last_attempt_at=ingest.last_attempt_at,
         ingest_last_success_at=ingest.last_success_at,
         ingest_last_error=ingest.last_error,
+        stream_unavailable_persisted=stream_unavailable_persisted(item),
     )
     base = LoggerOut.model_validate(item, from_attributes=True)
     return LoggerWithStatus(**base.model_dump(), status=status_obj)
+
+
+@router.patch("/bulk-monitoring", response_model=BulkUpdateResult)
+async def api_bulk_update_monitoring(
+    payload: LoggerBulkMonitoringUpdate,
+    session: AsyncSession = Depends(get_db_session),
+) -> BulkUpdateResult:
+    changed = payload.model_dump(exclude_unset=True)
+    changed.pop("apply_to_disabled", None)
+    if not changed:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No fields to update")
+    updated = await bulk_update_monitoring(session, payload)
+    return BulkUpdateResult(updated=updated)
 
 
 @router.get("/{logger_id}", response_model=LoggerWithStatus)
@@ -107,6 +131,7 @@ async def api_get_logger(
         last_measurement_at=last.captured_at if last else None,
         last_ok=last.ok if last else None,
         last_error=last.error if last else None,
+        stream_unavailable_persisted=stream_unavailable_persisted(item),
     )
     base = LoggerOut.model_validate(item, from_attributes=True)
     return LoggerWithStatus(**base.model_dump(), status=status_obj)
@@ -141,6 +166,7 @@ async def api_update_logger(
         last_measurement_at=last.captured_at if last else None,
         last_ok=last.ok if last else None,
         last_error=last.error if last else None,
+        stream_unavailable_persisted=stream_unavailable_persisted(item),
     )
     base = LoggerOut.model_validate(item, from_attributes=True)
     return LoggerWithStatus(**base.model_dump(), status=status_obj)

@@ -1,6 +1,7 @@
 import React from "react";
 import { useParams } from "react-router-dom";
 import { getLogger, updateLogger } from "../api/loggers";
+import { buildMediaUrl } from "../api/media";
 import { captureNow, listMeasurements, testRecognize, type Measurement, type TestRecognizeResult } from "../api/measurements";
 import type { GaugeType } from "../api/loggers";
 
@@ -143,7 +144,7 @@ export function LoggerSetupPage(): React.ReactElement {
       if (parsedCal?.max_point) setMaxPoint(parsedCal.max_point);
       if (typeof parsedCal?.min_value === "number" && Number.isFinite(parsedCal.min_value)) setMinScaleValue(parsedCal.min_value);
       if (typeof parsedCal?.max_value === "number" && Number.isFinite(parsedCal.max_value)) setMaxScaleValue(parsedCal.max_value);
-      setMeasurements(await listMeasurements(loggerId, 20));
+      setMeasurements((await listMeasurements({ loggerId, limit: 20 })).items);
     } catch (e) {
       setError(e instanceof Error ? e.message : "Failed to load setup data");
     }
@@ -336,14 +337,26 @@ export function LoggerSetupPage(): React.ReactElement {
     setStatus(null);
     try {
       JSON.parse(roiJson);
-      const parsedCal = JSON.parse(calibrationJson) as CalibrationData;
-      if (!parsedCal.center || !parsedCal.min_point || !parsedCal.max_point) {
-        throw new Error("Calibration needs center, min_point and max_point");
+      if (gaugeType === "digital") {
+        await updateLogger(loggerId, {
+          roi_json: roiJson,
+          calibration_json: null,
+          gauge_type: "digital",
+        });
+      } else {
+        const parsedCal = JSON.parse(calibrationJson) as CalibrationData;
+        if (!parsedCal.center || !parsedCal.min_point || !parsedCal.max_point) {
+          throw new Error("Calibration needs center, min_point and max_point");
+        }
+        if (typeof parsedCal.min_value !== "number" || typeof parsedCal.max_value !== "number") {
+          throw new Error("Calibration needs numeric min_value and max_value");
+        }
+        await updateLogger(loggerId, {
+          roi_json: roiJson,
+          calibration_json: calibrationJson,
+          gauge_type: "analog",
+        });
       }
-      if (typeof parsedCal.min_value !== "number" || typeof parsedCal.max_value !== "number") {
-        throw new Error("Calibration needs numeric min_value and max_value");
-      }
-      await updateLogger(loggerId, { roi_json: roiJson, calibration_json: calibrationJson });
       setStatus("Configuration saved");
       setLoadedRoiJson(roiJson);
       setCalibrationDirtyByRoi(false);
@@ -360,10 +373,32 @@ export function LoggerSetupPage(): React.ReactElement {
     setStatus(null);
     try {
       const m = await captureNow(loggerId);
-      setStatus(m.ok ? `Captured: ${m.value ?? "n/a"} ${m.unit}` : `Capture error: ${m.error ?? "unknown"}`);
+      const rangeNote =
+        m.out_of_range === true ? " · вне допустимого диапазона" : m.out_of_range === false ? " · в диапазоне" : "";
+      setStatus(m.ok ? `Captured: ${m.value ?? "n/a"} ${m.unit}${rangeNote}` : `Capture error: ${m.error ?? "unknown"}`);
       await refresh();
     } catch (e) {
       setError(e instanceof Error ? e.message : "Capture failed");
+    }
+  }
+
+  async function runTestRecognizeProductionParity(): Promise<void> {
+    if (!loggerId) return;
+    setError(null);
+    setStatus(null);
+    setTesting(true);
+    setTestResult(null);
+    try {
+      const r = await testRecognize(loggerId, { production_parity: true });
+      setTestResult(r);
+      const line = r.ok
+        ? `Production parity: ${r.value ?? "n/a"} (frame_source=${r.frame_source ?? "?"})`
+        : `Production parity error: ${r.error ?? "unknown"}`;
+      setStatus(line);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Production parity test failed");
+    } finally {
+      setTesting(false);
     }
   }
 
@@ -469,9 +504,28 @@ export function LoggerSetupPage(): React.ReactElement {
       <h1 className="text-2xl font-semibold">Logger setup</h1>
 
       <div className="rounded-lg border bg-white p-4 space-y-3">
-        <div className="flex items-center justify-between gap-2">
+        <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
           <div className="font-medium">ROI setup</div>
-          <div className="flex gap-2">
+          <label className="flex items-center gap-2 text-sm text-slate-700">
+            Gauge type
+            <select
+              className="rounded border px-2 py-1"
+              value={gaugeType}
+              onChange={(e) => {
+                setGaugeType(e.target.value as GaugeType);
+                setConfigSaved(false);
+              }}
+            >
+              <option value="analog">analog</option>
+              <option value="digital">digital</option>
+            </select>
+          </label>
+        </div>
+        <p className="text-xs text-slate-600 max-w-3xl">
+          «Test recognize» использует кадр из снимка и при необходимости несохранённые ROI/калибровку из полей ниже. «Test as production» вызывает тот же путь CV, что и фоновый процесс: RTMP + только данные из БД после Save config (
+          <span className="font-mono">production_parity</span>).
+        </p>
+        <div className="flex flex-wrap gap-2">
             <button className="rounded border px-3 py-2 text-sm" onClick={() => setSnapshotTs(Date.now())}>
               Refresh snapshot
             </button>
@@ -487,12 +541,20 @@ export function LoggerSetupPage(): React.ReactElement {
             >
               {testing ? "Testing…" : "Test recognize"}
             </button>
+            <button
+              className="rounded border border-slate-900 px-3 py-2 text-sm font-medium"
+              type="button"
+              title="Тот же recognize_from_image(image, logger), что и у фонового воркера; нужны сохранённые ROI/калибровка"
+              onClick={() => void runTestRecognizeProductionParity()}
+              disabled={testing || !configSaved || calibrationDirtyByRoi}
+            >
+              {testing ? "Testing…" : "Test as production"}
+            </button>
             {gaugeType === "analog" ? (
               <button className="rounded border px-3 py-2 text-sm" onClick={() => void runQualityTestSeries(6)} disabled={qualityRunning || !calibrationReady}>
                 {qualityRunning ? "Quality…" : "Quality x6"}
               </button>
             ) : null}
-          </div>
         </div>
         {gaugeType === "analog" ? (
           <div className="flex flex-wrap gap-2">
@@ -695,6 +757,19 @@ export function LoggerSetupPage(): React.ReactElement {
             <div>warnings: {(testResult.analog_debug.warnings ?? []).join(", ") || "none"}</div>
           </div>
         ) : null}
+        {(testResult?.cv_warnings?.length ?? 0) > 0 ? (
+          <div className="rounded border border-amber-200 bg-amber-50 p-3 text-xs text-amber-950 space-y-1">
+            <div className="font-medium">Предупреждения ROI / CV (ТЗ п.12, вариант 1)</div>
+            <ul className="list-disc pl-4 space-y-0.5 font-mono">
+              {(testResult?.cv_warnings ?? []).map((w) => (
+                <li key={w}>{w}</li>
+              ))}
+            </ul>
+            <div className="text-slate-600 normal-case">
+              Пустой кроп — ошибка; мелкая зона или почти весь кадр — предупреждения. См. docs/tz_p12_detection_variant1_operator_roi.md
+            </div>
+          </div>
+        ) : null}
         {gaugeType === "analog" && qualitySummary ? (
           <div className={`rounded border p-3 text-xs space-y-1 ${qualitySummary.pass ? "border-emerald-200 bg-emerald-50 text-emerald-900" : "border-amber-200 bg-amber-50 text-amber-900"}`}>
             <div>Quality gate: {qualitySummary.pass ? "PASS" : "RECALIBRATE"}</div>
@@ -783,11 +858,22 @@ export function LoggerSetupPage(): React.ReactElement {
           {measurements.map((m) => (
             <div key={m.id} className="px-4 py-3 text-sm">
               <div>
-                {m.ok ? `${m.value ?? "n/a"} ${m.unit}` : `Error: ${m.error ?? "unknown"}`} ·{" "}
-                {new Date(m.captured_at).toLocaleString()}
+                {m.ok ? `${m.value ?? "n/a"} ${m.unit}` : `Error: ${m.error ?? "unknown"}`}
+                {m.out_of_range === true ? (
+                  <span className="text-amber-800 font-medium"> · вне допустимого диапазона</span>
+                ) : m.out_of_range === false ? (
+                  <span className="text-slate-500"> · в диапазоне</span>
+                ) : null}
+                {m.cv_warnings_json ? (
+                  <span className="text-xs text-slate-500" title={m.cv_warnings_json}>
+                    {" "}
+                    CV: {m.cv_warnings_json}
+                  </span>
+                ) : null}{" "}
+                · {new Date(m.captured_at).toLocaleString()}
               </div>
               {m.image_path ? (
-                <a className="underline underline-offset-4" target="_blank" rel="noreferrer" href={`${apiBase}/media/${m.image_path}`}>
+                <a className="underline underline-offset-4" target="_blank" rel="noreferrer" href={buildMediaUrl(m.image_path)}>
                   Open image
                 </a>
               ) : null}

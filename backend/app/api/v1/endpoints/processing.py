@@ -30,7 +30,8 @@ from app.processing.pipeline import (
     record_ingest_success_now,
 )
 from app.schemas.measurement import MeasurementOut
-from app.services.loggers import get_logger
+from app.cv.config_readiness import logger_ready_for_automated_recognition
+from app.services.loggers import get_logger, record_stream_gap, record_stream_success
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -41,6 +42,14 @@ _STREAM_UNAVAILABLE_MSG = "Нет активного потока. Запуст�
 class TestRecognizeRequest(BaseModel):
     """Тело POST /test-recognize: опционально тот же JPEG, что на экране (snapshot), и/или ROI до сохранения в БД."""
 
+    production_parity: bool = Field(
+        default=False,
+        description=(
+            "Режим согласованности с боевым пайплайном: один кадр RTMP и recognize_from_image(image, logger) "
+            "без подмены roi_json/calibration_json из тела запроса (как process_logger_once). "
+            "Игнорирует frame_jpeg_base64 и поля подмены. Требует сохранённой валидной конфигурации в БД."
+        ),
+    )
     frame_jpeg_base64: str | None = Field(
         default=None,
         description="JPEG из последнего снимка в UI (base64). Если задан — распознавание по этому кадру, без повторного RTMP-захвата.",
@@ -100,6 +109,14 @@ async def api_capture_logger_once(
     try:
         return await process_logger_once(session, logger_id)
     except Exception as e:
+        await session.rollback()
+        try:
+            await record_stream_gap(session, logger_id, str(e))
+        except Exception:
+            logger.exception("record_stream_gap after capture failure")
+        msg = str(e)
+        if msg.startswith("configuration_incomplete:"):
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=msg) from e
         if _is_stream_unavailable(e):
             raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=_STREAM_UNAVAILABLE_MSG) from e
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e)) from e
@@ -116,6 +133,7 @@ async def api_logger_snapshot(
         # Без неё snapshot висит 36s на неактивном потоке, блокируя UI.
         stream_active = await check_nginx_stat_active(target.stream_key)
         if not stream_active:
+            await record_stream_gap(session, target.id, "no_active_publisher")
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                 detail=_STREAM_UNAVAILABLE_MSG,
@@ -124,11 +142,17 @@ async def api_logger_snapshot(
         jpeg_bytes = await asyncio.wait_for(capture_frame_to_memory(stream_url), timeout=48.0)
         _validate_jpeg_bytes(jpeg_bytes)
         await record_ingest_success_now(target.stream_key)
+        await record_stream_success(session, target.id)
         return Response(content=jpeg_bytes, media_type="image/jpeg")
     except HTTPException:
         raise
     except Exception as e:
+        await session.rollback()
         if _is_stream_unavailable(e):
+            try:
+                await record_stream_gap(session, logger_id, str(e))
+            except Exception:
+                logger.exception("record_stream_gap after snapshot failure")
             raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=_STREAM_UNAVAILABLE_MSG) from e
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e)) from e
 
@@ -143,15 +167,16 @@ async def api_test_recognize(
         target = await get_logger(session, logger_id)
         frame_source: str
 
-        if body.frame_jpeg_base64:
-            try:
-                jpeg_bytes = _decode_optional_jpeg_base64(body.frame_jpeg_base64)
-            except (ValueError, RuntimeError) as e:
-                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e)) from e
-            frame_source = "client_jpeg"
-        else:
+        if body.production_parity:
+            ready, reason = logger_ready_for_automated_recognition(target)
+            if not ready:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"configuration_incomplete:{reason}",
+                )
             stream_active = await check_nginx_stat_active(target.stream_key)
             if not stream_active:
+                await record_stream_gap(session, target.id, "no_active_publisher")
                 raise HTTPException(
                     status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                     detail=_STREAM_UNAVAILABLE_MSG,
@@ -160,6 +185,27 @@ async def api_test_recognize(
             jpeg_bytes = await asyncio.wait_for(capture_frame_to_memory(stream_url), timeout=48.0)
             _validate_jpeg_bytes(jpeg_bytes)
             await record_ingest_success_now(target.stream_key)
+            await record_stream_success(session, target.id)
+            frame_source = "rtmp_production_parity"
+        elif body.frame_jpeg_base64:
+            try:
+                jpeg_bytes = _decode_optional_jpeg_base64(body.frame_jpeg_base64)
+            except (ValueError, RuntimeError) as e:
+                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e)) from e
+            frame_source = "client_jpeg"
+        else:
+            stream_active = await check_nginx_stat_active(target.stream_key)
+            if not stream_active:
+                await record_stream_gap(session, target.id, "no_active_publisher")
+                raise HTTPException(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    detail=_STREAM_UNAVAILABLE_MSG,
+                )
+            stream_url = f"{settings.rtmp_base_url.rstrip('/')}/{target.stream_key}"
+            jpeg_bytes = await asyncio.wait_for(capture_frame_to_memory(stream_url), timeout=48.0)
+            _validate_jpeg_bytes(jpeg_bytes)
+            await record_ingest_success_now(target.stream_key)
+            await record_stream_success(session, target.id)
             frame_source = "rtmp_capture"
 
         nparr = np.frombuffer(jpeg_bytes, np.uint8)
@@ -172,19 +218,23 @@ async def api_test_recognize(
             if body.calibration_json is not None and body.calibration_json.strip()
             else None
         )
-        cv_result = recognize_from_image(
-            image,
-            target,
-            roi_json_override=body.roi_json,
-            calibration_json_override=cal_override,
-        )
+        if body.production_parity:
+            cv_result = recognize_from_image(image, target)
+        else:
+            cv_result = recognize_from_image(
+                image,
+                target,
+                roi_json_override=body.roi_json,
+                calibration_json_override=cal_override,
+            )
 
         # Для интерактивной настройки ROI возвращаем вырезанный ROI всегда,
         # даже если распознавание не удалось.
         roi_b64: str | None = None
         from app.cv.recognizer import _apply_roi, _parse_json
 
-        roi_data = _parse_json(body.roi_json if body.roi_json is not None else target.roi_json)
+        roi_for_preview = target.roi_json if body.production_parity else (body.roi_json if body.roi_json is not None else target.roi_json)
+        roi_data = _parse_json(roi_for_preview)
         roi_image = _apply_roi(image, roi_data)
         if roi_image.size > 0:
             _, buf = cv2.imencode(".jpg", roi_image)
@@ -203,7 +253,10 @@ async def api_test_recognize(
 
         analog_debug: dict[str, Any] | None = None
         if target.gauge_type == GaugeType.analog:
-            calibration_data = _parse_json(cal_override if cal_override is not None else target.calibration_json)
+            if body.production_parity:
+                calibration_data = _parse_json(target.calibration_json)
+            else:
+                calibration_data = _parse_json(cal_override if cal_override is not None else target.calibration_json)
             rx, ry = _roi_origin(roi_data)
             cal_roi = _calibration_to_roi_coords(calibration_data, rx, ry)
             analog_debug = analog_debug_from_image(roi_image, cal_roi)
@@ -216,11 +269,17 @@ async def api_test_recognize(
             "ocr_raw": cv_result.ocr_raw,
             "frame_source": frame_source,
             "analog_debug": analog_debug,
+            "cv_warnings": cv_result.warnings,
         }
     except HTTPException:
         raise
     except Exception as e:
+        await session.rollback()
         if _is_stream_unavailable(e):
+            try:
+                await record_stream_gap(session, logger_id, str(e))
+            except Exception:
+                logger.exception("record_stream_gap after test-recognize failure")
             raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=_STREAM_UNAVAILABLE_MSG) from e
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e)) from e
 

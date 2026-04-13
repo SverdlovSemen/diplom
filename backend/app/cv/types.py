@@ -9,4 +9,5 @@ class CVResult:
     ok: bool
     error: str | None = None
     ocr_raw: str | None = None
+    warnings: list[str] | None = None
 
