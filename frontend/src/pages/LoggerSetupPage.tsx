@@ -1,6 +1,7 @@
 import React from "react";
 import { useParams } from "react-router-dom";
 import { getLogger, updateLogger } from "../api/loggers";
+import { getStoredAccessToken } from "../api/client";
 import { buildMediaUrl } from "../api/media";
 import { captureNow, listMeasurements, testRecognize, type Measurement, type TestRecognizeResult } from "../api/measurements";
 import type { GaugeType } from "../api/loggers";
@@ -194,6 +195,11 @@ export function LoggerSetupPage(): React.ReactElement {
   }, [recommendedTool, gaugeType]);
 
   React.useEffect(() => {
+    if (gaugeType !== "digital") return;
+    setToolMode("roi");
+  }, [gaugeType]);
+
+  React.useEffect(() => {
     if (!loggerId) return;
     let cancelled = false;
     let createdBlobUrl: string | null = null;
@@ -211,7 +217,11 @@ export function LoggerSetupPage(): React.ReactElement {
       const ac = new AbortController();
       const to = window.setTimeout(() => ac.abort(), SNAPSHOT_FETCH_TIMEOUT_MS);
       try {
-        const res = await fetch(url, { signal: ac.signal });
+        const token = getStoredAccessToken();
+        const res = await fetch(url, {
+          signal: ac.signal,
+          headers: token ? { Authorization: `Bearer ${token}` } : undefined,
+        });
         if (!res.ok) {
           let detail = res.status === 503 ? DEFAULT_SNAPSHOT_ERROR : `Снимок недоступен (${res.status})`;
           try {

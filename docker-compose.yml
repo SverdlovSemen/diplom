@@ -49,7 +49,7 @@ services:
   ffmpeg-test:
     build:
       context: ./docker/ffmpeg-test
-    #profiles: ["test-stream"]
+    profiles: ["test-stream"]
     depends_on:
       nginx-rtmp:
         condition: service_healthy
@@ -64,7 +64,7 @@ services:
   ffmpeg-analog:
     build:
       context: ./docker/ffmpeg-analog
-    #profiles: ["test-stream-analog"]
+    profiles: ["test-stream-analog"]
     depends_on:
       nginx-rtmp:
         condition: service_healthy
