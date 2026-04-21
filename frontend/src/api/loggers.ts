@@ -1,6 +1,6 @@
 import { apiFetch } from "./client";
 
-export type GaugeType = "analog" | "digital";
+export type GaugeType = "analog" | "digital" | "digital_segment";
 export type CaptureMode = "continuous" | "schedule";
 
 export type Logger = {

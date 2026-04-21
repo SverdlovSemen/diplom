@@ -215,6 +215,178 @@ def _recognize_digital(image: np.ndarray) -> CVResult:
     return CVResult(value=None, ok=False, error=f"OCR failed: '{joined}'", ocr_raw=joined)
 
 
+def _recognize_digital_segment(image: np.ndarray) -> CVResult:
+    src = image
+    h, w = src.shape[:2]
+    target_h = 200
+    if h > 0 and h < target_h:
+        scale = target_h / float(h)
+        src = cv2.resize(
+            src,
+            (max(1, int(round(w * scale))), max(1, int(round(h * scale)))),
+            interpolation=cv2.INTER_CUBIC,
+        )
+
+    gray = cv2.cvtColor(src, cv2.COLOR_BGR2GRAY)
+    gray = cv2.GaussianBlur(gray, (3, 3), 0)
+    clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
+    gray = clahe.apply(gray)
+
+    # Для LCD-подобных экранов (светлый/зеленоватый фон + темные сегменты)
+    # базовый вариант — бинаризация темных сегментов.
+    _, dark_otsu = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+
+    # Локальный вариант помогает при неравномерной подсветке экрана/бликах.
+    dark_adapt = cv2.adaptiveThreshold(
+        gray,
+        255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY_INV,
+        31,
+        4,
+    )
+
+    # Цветовые варианты под LCD (зеленоватая подложка + почти черные сегменты).
+    hsv = cv2.cvtColor(src, cv2.COLOR_BGR2HSV)
+    # Темные/черные символы: низкая яркость V.
+    dark_hsv = cv2.inRange(hsv, (0, 0, 0), (180, 255, 95))
+    # Низкая насыщенность + низкая L в Lab помогает при пересвете.
+    lab = cv2.cvtColor(src, cv2.COLOR_BGR2Lab)
+    l_chan = lab[:, :, 0]
+    b_chan = lab[:, :, 2]
+    _, dark_l = cv2.threshold(l_chan, 120, 255, cv2.THRESH_BINARY_INV)
+    _, weak_green_bias = cv2.threshold(b_chan, 145, 255, cv2.THRESH_BINARY_INV)
+    dark_lab = cv2.bitwise_and(dark_l, weak_green_bias)
+
+    k_open = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
+    k_close = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+    variants: list[np.ndarray] = [
+        cv2.morphologyEx(dark_otsu, cv2.MORPH_OPEN, k_open),
+        cv2.morphologyEx(dark_otsu, cv2.MORPH_CLOSE, k_close),
+        cv2.morphologyEx(dark_adapt, cv2.MORPH_OPEN, k_open),
+        cv2.morphologyEx(dark_adapt, cv2.MORPH_CLOSE, k_close),
+        cv2.morphologyEx(dark_hsv, cv2.MORPH_OPEN, k_open),
+        cv2.morphologyEx(dark_hsv, cv2.MORPH_CLOSE, k_close),
+        cv2.morphologyEx(dark_lab, cv2.MORPH_OPEN, k_open),
+        cv2.morphologyEx(dark_lab, cv2.MORPH_CLOSE, k_close),
+    ]
+    warnings: list[str] = []
+    foreground_ratio = float(np.count_nonzero(variants[0])) / float(max(1, variants[0].size))
+    if foreground_ratio < 0.01:
+        warnings.append("segment_foreground_too_sparse")
+    elif foreground_ratio > 0.55:
+        warnings.append("segment_foreground_too_dense")
+
+    def _looks_like_leading_minus(bin_img: np.ndarray) -> bool:
+        h2, w2 = bin_img.shape[:2]
+        if h2 < 20 or w2 < 40:
+            return False
+        # Ищем небольшой горизонтальный штрих в левой части табло.
+        left = bin_img[:, : max(1, int(w2 * 0.28))]
+        num_labels, _labels, stats, _ = cv2.connectedComponentsWithStats(left, connectivity=8)
+        for i in range(1, num_labels):
+            x = int(stats[i, cv2.CC_STAT_LEFT])
+            y = int(stats[i, cv2.CC_STAT_TOP])
+            ww = int(stats[i, cv2.CC_STAT_WIDTH])
+            hh = int(stats[i, cv2.CC_STAT_HEIGHT])
+            area = int(stats[i, cv2.CC_STAT_AREA])
+            if area < 20:
+                continue
+            if hh <= 0 or ww <= 0:
+                continue
+            aspect = ww / float(hh)
+            y_center = y + hh / 2.0
+            # Минус обычно тонкий, горизонтальный, около середины по Y.
+            if (
+                aspect >= 2.0
+                and ww >= max(6, int(w2 * 0.025))
+                and hh <= max(14, int(h2 * 0.11))
+                and h2 * 0.20 <= y_center <= h2 * 0.80
+                and x <= int(w2 * 0.22)
+            ):
+                return True
+        return False
+
+    has_leading_minus_shape = any(_looks_like_leading_minus(v) for v in variants)
+
+    def _normalize_numeric_token(token: str) -> str | None:
+        token = token.replace(",", ".").replace(" ", "")
+        token = re.sub(r"[^0-9.\-]", "", token)
+        if not token:
+            return None
+        if token.count("-") > 1:
+            token = token.replace("-", "")
+        if "-" in token and not token.startswith("-"):
+            token = "-" + token.replace("-", "")
+        if token.count(".") > 1:
+            first = token.find(".")
+            token = token[: first + 1] + token[first + 1 :].replace(".", "")
+        if token in {"-", ".", "-."}:
+            return None
+        return token
+
+    def _extract_numeric_token(text: str) -> str | None:
+        m = re.search(r"-?\d+(?:[.,]\d+)?", text)
+        if not m:
+            return None
+        return _normalize_numeric_token(m.group(0))
+
+    psm_modes = (7, 8, 6, 13)
+    raw_candidates: list[str] = []
+    best: tuple[float, float, str, str] | None = None
+
+    for img in variants:
+        for psm in psm_modes:
+            config = (
+                f"--oem 1 --psm {psm} "
+                "-c tessedit_char_whitelist=0123456789.- "
+                "-c classify_bln_numeric_mode=1"
+            )
+            raw = pytesseract.image_to_string(img, config=config).strip().replace(",", ".")
+            raw_candidates.append(raw)
+            token = _extract_numeric_token(raw)
+            if token is None:
+                continue
+            if has_leading_minus_shape and not token.startswith("-"):
+                token = "-" + token
+            try:
+                value = float(token)
+            except ValueError:
+                continue
+
+            score = 0.0
+            if len(token.replace("-", "")) >= 2:
+                score += 1.1
+            if "." in token:
+                score += 0.8
+            try:
+                data = pytesseract.image_to_data(img, config=config, output_type=pytesseract.Output.DICT)
+                conf_vals = [
+                    float(c)
+                    for c, t in zip(data.get("conf", []), data.get("text", []))
+                    if str(c).strip() not in {"", "-1"} and str(t).strip()
+                ]
+                if conf_vals:
+                    score += max(conf_vals) / 100.0
+            except Exception:
+                pass
+
+            if best is None or score > best[0]:
+                best = (score, value, token, raw)
+
+    if best is not None:
+        return CVResult(value=best[1], ok=True, ocr_raw=best[3], warnings=warnings or None)
+
+    joined = " | ".join(x for x in raw_candidates if x)
+    return CVResult(
+        value=None,
+        ok=False,
+        error=f"OCR segment failed: '{joined}'",
+        ocr_raw=joined,
+        warnings=warnings or None,
+    )
+
+
 def _angle_from_center(center: tuple[float, float], point: tuple[float, float]) -> float:
     dx = point[0] - center[0]
     dy = center[1] - point[1]
@@ -693,6 +865,8 @@ def recognize_from_image(
     _append_roi_geometry_warnings(roi_geom_warnings, roi_image, roi_data, image.shape)
     if logger.gauge_type == GaugeType.digital:
         return _merge_cv_warnings(_recognize_digital(roi_image), roi_geom_warnings)
+    if logger.gauge_type == GaugeType.digital_segment:
+        return _merge_cv_warnings(_recognize_digital_segment(roi_image), roi_geom_warnings)
     rx, ry = _roi_origin(roi_data)
     cal_roi = _calibration_to_roi_coords(calibration_data, rx, ry)
     return _merge_cv_warnings(_recognize_analog(roi_image, cal_roi), roi_geom_warnings)

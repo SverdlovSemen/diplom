@@ -195,7 +195,7 @@ export function LoggerSetupPage(): React.ReactElement {
   }, [recommendedTool, gaugeType]);
 
   React.useEffect(() => {
-    if (gaugeType !== "digital") return;
+    if (gaugeType !== "digital" && gaugeType !== "digital_segment") return;
     setToolMode("roi");
   }, [gaugeType]);
 
@@ -347,11 +347,11 @@ export function LoggerSetupPage(): React.ReactElement {
     setStatus(null);
     try {
       JSON.parse(roiJson);
-      if (gaugeType === "digital") {
+      if (gaugeType === "digital" || gaugeType === "digital_segment") {
         await updateLogger(loggerId, {
           roi_json: roiJson,
           calibration_json: null,
-          gauge_type: "digital",
+          gauge_type: gaugeType,
         });
       } else {
         const parsedCal = JSON.parse(calibrationJson) as CalibrationData;
@@ -528,6 +528,7 @@ export function LoggerSetupPage(): React.ReactElement {
             >
               <option value="analog">analog</option>
               <option value="digital">digital</option>
+              <option value="digital_segment">digital_segment</option>
             </select>
           </label>
         </div>
@@ -535,6 +536,17 @@ export function LoggerSetupPage(): React.ReactElement {
           «Test recognize» использует кадр из снимка и при необходимости несохранённые ROI/калибровку из полей ниже. «Test as production» вызывает тот же путь CV, что и фоновый процесс: RTMP + только данные из БД после Save config (
           <span className="font-mono">production_parity</span>).
         </p>
+        {gaugeType === "digital_segment" ? (
+          <div className="rounded border bg-emerald-50 px-3 py-2 text-xs text-emerald-900">
+            digital_segment: используйте плотный ROI по экрану табло с семисегментными цифрами (светлый/зеленоватый фон + темные сегменты).
+          </div>
+        ) : null}
+        {gaugeType === "digital_segment" ? (
+          <div className="rounded border bg-slate-50 px-3 py-2 text-xs text-slate-700">
+            Рекомендуемый порядок: Refresh snapshot - ROI - Save config - Test recognize - Test as production.
+            Для этого режима profile test-stream (белые цифры на черном фоне) не является репрезентативным.
+          </div>
+        ) : null}
         <div className="flex flex-wrap gap-2">
             <button className="rounded border px-3 py-2 text-sm" onClick={() => setSnapshotTs(Date.now())}>
               Refresh snapshot
@@ -780,7 +792,7 @@ export function LoggerSetupPage(): React.ReactElement {
             </div>
           </div>
         ) : null}
-        {gaugeType === "analog" && qualitySummary ? (
+          {gaugeType === "analog" && qualitySummary ? (
           <div className={`rounded border p-3 text-xs space-y-1 ${qualitySummary.pass ? "border-emerald-200 bg-emerald-50 text-emerald-900" : "border-amber-200 bg-amber-50 text-amber-900"}`}>
             <div>Quality gate: {qualitySummary.pass ? "PASS" : "RECALIBRATE"}</div>
             <div>samples={qualitySummary.samples}, ok={qualitySummary.okCount}, fail={qualitySummary.failCount}</div>

@@ -1,0 +1,22 @@
+services:
+  backend-tests:
+    build:
+      context: ./backend
+    working_dir: /workspace
+    command: >
+      sh -lc "pip install --no-cache-dir -r requirements-dev.txt &&
+      PYTHONPATH=/workspace pytest -q"
+    volumes:
+      - ./backend:/workspace
+    environment:
+      APP_ENV: test
+      APP_DATABASE_URL: ${APP_DATABASE_URL:-postgresql+asyncpg://gauges:gauges@postgres:5432/gauges}
+      APP_REDIS_URL: ${APP_REDIS_URL:-redis://redis:6379/0}
+      APP_STORAGE_DIR: /tmp/data
+      APP_RTMP_BASE_URL: ${APP_RTMP_BASE_URL:-rtmp://nginx-rtmp:1935/live}
+      APP_RTMP_STAT_URL: ${APP_RTMP_STAT_URL:-http://nginx-rtmp:8080/stat}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy

@@ -104,6 +104,57 @@ docker compose --profile test-stream stop ffmpeg-test
 
 (или `docker compose down` остановит всё.)
 
+### Дополнительно: `digital_segment` (семисегментный LCD)
+
+Backend поддерживает отдельный тип прибора `digital_segment` для кадров вида «светлый/зеленоватый фон + тёмные семисегментные цифры».
+
+- Текущие режимы `analog` и `digital` сохранены без изменений.
+- В UI доступен отдельный выбор типа `digital_segment` (Create/Edit logger и Logger setup).
+- Для `digital_segment` достаточно валидного ROI (как и для `digital`).
+
+Тестовые кадры для этого режима:
+
+- Папка: `test_images/digital_segment/`
+- Генерация: `py scripts/generate_digital_segment_samples.py`
+- Пояснения: `test_images/digital_segment/README.txt`
+
+Важно: профиль `test-stream` (`ffmpeg-test`) генерирует белые цифры на черном фоне и предназначен для обычного `digital`, а не для `digital_segment`.
+
+### Полный ручной сценарий проверки `digital_segment` через UI
+
+1. Запустите стек:
+
+```bash
+docker compose up --build
+```
+
+2. Откройте UI: `http://localhost:5173` и войдите администратором.
+3. В разделе **Loggers** создайте логгер:
+   - `gauge_type = digital_segment`
+   - `stream_key` под ваш RTMP поток (например, `logger-seg-1`)
+4. Подайте видеопоток с кадрами семисегментного экрана:
+   - телефон (Prism RTMP) или
+   - статичные кадры/экран компьютера с изображениями из `test_images/digital_segment/`.
+5. Откройте **Setup** для этого логгера и выполните:
+   - `Refresh snapshot`
+   - выделите плотный `ROI` только по табло
+   - `Save config`
+6. Нажмите `Test recognize` и проверьте:
+   - `Recognized: <value>`
+   - `OCR raw` содержит ожидаемую строку
+7. Нажмите `Test as production` и проверьте:
+   - ответ успешный
+   - используется production-путь распознавания (по сохраненной конфигурации в БД)
+
+### Smoke-checklist для релизной ручной проверки
+
+- Логгер с `digital_segment` создается и редактируется из UI.
+- На странице Setup для `digital_segment` требуется только валидный ROI.
+- `Save config` сохраняет тип `digital_segment` без analog-калибровки.
+- `Test recognize` возвращает значение/OCR на текущем snapshot.
+- `Test as production` возвращает согласованный результат по RTMP-пути.
+- Существующие сценарии `analog` и `digital` продолжают работать как раньше.
+
 ### Аналоговый тестовый поток (стрелка) → логгер `logger-1`
 
 Нужны кадры в `test_images/analog_sequence/` (если их нет — сгенерируйте один раз на машине с Python):
@@ -249,6 +300,28 @@ docker compose --profile test-stream up --build -d
 ```bash
 cd backend
 alembic upgrade head
+```
+
+## Тесты backend CV
+
+Для запуска тестов (включая `digital_segment`):
+
+```bash
+cd backend
+pip install -r requirements-dev.txt
+pytest -q
+```
+
+Запуск в Docker без изменения production-контейнера:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.tests.yml run --rm backend-tests
+```
+
+Если установлен `make`:
+
+```bash
+make test-backend
 ```
 
 ---

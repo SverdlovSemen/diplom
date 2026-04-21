@@ -7,7 +7,7 @@ from typing import Literal
 from pydantic import BaseModel, Field
 
 
-GaugeType = Literal["analog", "digital"]
+GaugeType = Literal["analog", "digital", "digital_segment"]
 CaptureMode = Literal["continuous", "schedule"]
 
 
