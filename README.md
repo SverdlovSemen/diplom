@@ -145,6 +145,21 @@ docker compose up --build
 7. Нажмите `Test as production` и проверьте:
    - ответ успешный
    - используется production-путь распознавания (по сохраненной конфигурации в БД)
+8. Повторите шаги 5-7 для реальных фото из `test_images/digital_segment_real/`:
+   - используйте ваши реальные файлы (например, `image1.png` ... `image5.png`)
+   - expected значения берите из `test_images/digital_segment_real/README.md`
+9. PASS/FAIL критерии для real-case:
+   - **PASS**: как минимум 4 кадра из real-набора распознаны корректно (целевой уровень 5/5), различие только `,`/`.` считается нормой (backend нормализует в `.`)
+   - **PASS**: при попадании в ROI единиц измерения (`MWh`, `MBTч`, `Gcal`) они не должны становиться итоговым числом
+   - **WARN**: допустимы предупреждения `segment_screen_not_found`, `segment_unit_text_intrusion`, `segment_low_confidence`
+   - **FAIL**: предупреждения `segment_digit_row_not_found` или `segment_conflicting_candidates` сопровождаются некорректным числом/отсутствием результата
+10. Опционально для быстрого batch-check (вне UI) используйте:
+
+```bash
+docker compose -p gauge-reader-system -f docker-compose.yml -f docker-compose.tests.yml run --rm -v "C:/files/Projects/Python/diplom/gauge-reader-system/test_images/digital_segment_real:/real" backend-tests python tests/evaluate_digital_segment_real.py --images-dir /real --expected-json /real/expected_values.json --tolerance 0.0005
+```
+
+Этот batch-check не заменяет UI/manual сценарий: финальный verdict дается по ROI-настройке в Setup.
 
 ### Smoke-checklist для релизной ручной проверки
 
@@ -153,6 +168,7 @@ docker compose up --build
 - `Save config` сохраняет тип `digital_segment` без analog-калибровки.
 - `Test recognize` возвращает значение/OCR на текущем snapshot.
 - `Test as production` возвращает согласованный результат по RTMP-пути.
+- Реальные фото из `test_images/digital_segment_real/` проходят PASS-критерии из сценария выше.
 - Существующие сценарии `analog` и `digital` продолжают работать как раньше.
 
 ### Аналоговый тестовый поток (стрелка) → логгер `logger-1`

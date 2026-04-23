@@ -538,13 +538,13 @@ export function LoggerSetupPage(): React.ReactElement {
         </p>
         {gaugeType === "digital_segment" ? (
           <div className="rounded border bg-emerald-50 px-3 py-2 text-xs text-emerald-900">
-            digital_segment: используйте плотный ROI по экрану табло с семисегментными цифрами (светлый/зеленоватый фон + темные сегменты).
+            digital_segment: выбирайте только окно LCD с цифрами (светлый/зеленоватый фон + темные сегменты), без подписей единиц справа/снизу.
           </div>
         ) : null}
         {gaugeType === "digital_segment" ? (
           <div className="rounded border bg-slate-50 px-3 py-2 text-xs text-slate-700">
             Рекомендуемый порядок: Refresh snapshot - ROI - Save config - Test recognize - Test as production.
-            Для этого режима profile test-stream (белые цифры на черном фоне) не является репрезентативным.
+            Для этого режима profile test-stream (белые цифры на черном фоне) не является репрезентативным. Цель: контраст цифр к фону без бликов и пересвета.
           </div>
         ) : null}
         <div className="flex flex-wrap gap-2">
