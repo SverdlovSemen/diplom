@@ -219,7 +219,6 @@ function LoggerRow({ logger, rtmpBaseUrl, onCapture, onRefresh, setPageError }: 
             >
               <option value="analog">analog</option>
               <option value="digital">digital</option>
-              <option value="digital_segment">digital_segment</option>
             </select>
             <input
               className="rounded border px-2 py-1"
@@ -550,7 +549,6 @@ export function LoggersPage(): React.ReactElement {
           >
             <option value="analog">analog</option>
             <option value="digital">digital</option>
-            <option value="digital_segment">digital_segment</option>
           </select>
           <input
             className="rounded border px-2 py-1"

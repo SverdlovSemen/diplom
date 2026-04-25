@@ -195,7 +195,7 @@ export function LoggerSetupPage(): React.ReactElement {
   }, [recommendedTool, gaugeType]);
 
   React.useEffect(() => {
-    if (gaugeType !== "digital" && gaugeType !== "digital_segment") return;
+    if (gaugeType !== "digital") return;
     setToolMode("roi");
   }, [gaugeType]);
 
@@ -347,7 +347,7 @@ export function LoggerSetupPage(): React.ReactElement {
     setStatus(null);
     try {
       JSON.parse(roiJson);
-      if (gaugeType === "digital" || gaugeType === "digital_segment") {
+      if (gaugeType === "digital") {
         await updateLogger(loggerId, {
           roi_json: roiJson,
           calibration_json: null,
@@ -528,7 +528,6 @@ export function LoggerSetupPage(): React.ReactElement {
             >
               <option value="analog">analog</option>
               <option value="digital">digital</option>
-              <option value="digital_segment">digital_segment</option>
             </select>
           </label>
         </div>
@@ -536,17 +535,6 @@ export function LoggerSetupPage(): React.ReactElement {
           «Test recognize» использует кадр из снимка и при необходимости несохранённые ROI/калибровку из полей ниже. «Test as production» вызывает тот же путь CV, что и фоновый процесс: RTMP + только данные из БД после Save config (
           <span className="font-mono">production_parity</span>).
         </p>
-        {gaugeType === "digital_segment" ? (
-          <div className="rounded border bg-emerald-50 px-3 py-2 text-xs text-emerald-900">
-            digital_segment: используйте плотный ROI по экрану табло с семисегментными цифрами (светлый/зеленоватый фон + темные сегменты).
-          </div>
-        ) : null}
-        {gaugeType === "digital_segment" ? (
-          <div className="rounded border bg-slate-50 px-3 py-2 text-xs text-slate-700">
-            Рекомендуемый порядок: Refresh snapshot - ROI - Save config - Test recognize - Test as production.
-            Для этого режима profile test-stream (белые цифры на черном фоне) не является репрезентативным.
-          </div>
-        ) : null}
         <div className="flex flex-wrap gap-2">
             <button className="rounded border px-3 py-2 text-sm" onClick={() => setSnapshotTs(Date.now())}>
               Refresh snapshot

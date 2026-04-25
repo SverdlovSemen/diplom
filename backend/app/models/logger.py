@@ -14,7 +14,6 @@ from app.db.base import Base
 class GaugeType(str, enum.Enum):
     analog = "analog"
     digital = "digital"
-    digital_segment = "digital_segment"
 
 
 class CaptureMode(str, enum.Enum):

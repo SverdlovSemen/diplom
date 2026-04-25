@@ -17,7 +17,7 @@ def logger_ready_for_automated_recognition(logger: Logger) -> tuple[bool, str | 
     if w < 5 or h < 5:
         return False, "roi_invalid_or_too_small"
 
-    if logger.gauge_type in {GaugeType.digital, GaugeType.digital_segment}:
+    if logger.gauge_type == GaugeType.digital:
         return True, None
 
     cal = _parse_json(logger.calibration_json)

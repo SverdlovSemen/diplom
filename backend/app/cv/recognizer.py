@@ -13,6 +13,15 @@ import pytesseract
 from app.cv.types import CVResult
 from app.models.logger import GaugeType, Logger
 
+NEAR_MIN_ZONE_DEG = 14.0
+ANTI_MIN_WINDOW_DEG = 24.0
+ANTI_MIN_PENALTY_BASE = 2.4
+ZERO_ZONE_MIN_BONUS = 16.0
+ZERO_ZONE_ANTI_PENALTY = 18.0
+POSTCHECK_RADIAL_TO_MIN_DEG = 15.0
+POSTCHECK_SELECTED_TO_ANTI_DEG = 22.0
+MIN_COMPATIBLE_ANGLE_DEG = 26.0
+
 
 def _parse_json(value: str | None) -> dict[str, Any]:
     if not value:
@@ -215,178 +224,6 @@ def _recognize_digital(image: np.ndarray) -> CVResult:
     return CVResult(value=None, ok=False, error=f"OCR failed: '{joined}'", ocr_raw=joined)
 
 
-def _recognize_digital_segment(image: np.ndarray) -> CVResult:
-    src = image
-    h, w = src.shape[:2]
-    target_h = 200
-    if h > 0 and h < target_h:
-        scale = target_h / float(h)
-        src = cv2.resize(
-            src,
-            (max(1, int(round(w * scale))), max(1, int(round(h * scale)))),
-            interpolation=cv2.INTER_CUBIC,
-        )
-
-    gray = cv2.cvtColor(src, cv2.COLOR_BGR2GRAY)
-    gray = cv2.GaussianBlur(gray, (3, 3), 0)
-    clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
-    gray = clahe.apply(gray)
-
-    # Для LCD-подобных экранов (светлый/зеленоватый фон + темные сегменты)
-    # базовый вариант — бинаризация темных сегментов.
-    _, dark_otsu = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-
-    # Локальный вариант помогает при неравномерной подсветке экрана/бликах.
-    dark_adapt = cv2.adaptiveThreshold(
-        gray,
-        255,
-        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-        cv2.THRESH_BINARY_INV,
-        31,
-        4,
-    )
-
-    # Цветовые варианты под LCD (зеленоватая подложка + почти черные сегменты).
-    hsv = cv2.cvtColor(src, cv2.COLOR_BGR2HSV)
-    # Темные/черные символы: низкая яркость V.
-    dark_hsv = cv2.inRange(hsv, (0, 0, 0), (180, 255, 95))
-    # Низкая насыщенность + низкая L в Lab помогает при пересвете.
-    lab = cv2.cvtColor(src, cv2.COLOR_BGR2Lab)
-    l_chan = lab[:, :, 0]
-    b_chan = lab[:, :, 2]
-    _, dark_l = cv2.threshold(l_chan, 120, 255, cv2.THRESH_BINARY_INV)
-    _, weak_green_bias = cv2.threshold(b_chan, 145, 255, cv2.THRESH_BINARY_INV)
-    dark_lab = cv2.bitwise_and(dark_l, weak_green_bias)
-
-    k_open = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
-    k_close = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
-    variants: list[np.ndarray] = [
-        cv2.morphologyEx(dark_otsu, cv2.MORPH_OPEN, k_open),
-        cv2.morphologyEx(dark_otsu, cv2.MORPH_CLOSE, k_close),
-        cv2.morphologyEx(dark_adapt, cv2.MORPH_OPEN, k_open),
-        cv2.morphologyEx(dark_adapt, cv2.MORPH_CLOSE, k_close),
-        cv2.morphologyEx(dark_hsv, cv2.MORPH_OPEN, k_open),
-        cv2.morphologyEx(dark_hsv, cv2.MORPH_CLOSE, k_close),
-        cv2.morphologyEx(dark_lab, cv2.MORPH_OPEN, k_open),
-        cv2.morphologyEx(dark_lab, cv2.MORPH_CLOSE, k_close),
-    ]
-    warnings: list[str] = []
-    foreground_ratio = float(np.count_nonzero(variants[0])) / float(max(1, variants[0].size))
-    if foreground_ratio < 0.01:
-        warnings.append("segment_foreground_too_sparse")
-    elif foreground_ratio > 0.55:
-        warnings.append("segment_foreground_too_dense")
-
-    def _looks_like_leading_minus(bin_img: np.ndarray) -> bool:
-        h2, w2 = bin_img.shape[:2]
-        if h2 < 20 or w2 < 40:
-            return False
-        # Ищем небольшой горизонтальный штрих в левой части табло.
-        left = bin_img[:, : max(1, int(w2 * 0.28))]
-        num_labels, _labels, stats, _ = cv2.connectedComponentsWithStats(left, connectivity=8)
-        for i in range(1, num_labels):
-            x = int(stats[i, cv2.CC_STAT_LEFT])
-            y = int(stats[i, cv2.CC_STAT_TOP])
-            ww = int(stats[i, cv2.CC_STAT_WIDTH])
-            hh = int(stats[i, cv2.CC_STAT_HEIGHT])
-            area = int(stats[i, cv2.CC_STAT_AREA])
-            if area < 20:
-                continue
-            if hh <= 0 or ww <= 0:
-                continue
-            aspect = ww / float(hh)
-            y_center = y + hh / 2.0
-            # Минус обычно тонкий, горизонтальный, около середины по Y.
-            if (
-                aspect >= 2.0
-                and ww >= max(6, int(w2 * 0.025))
-                and hh <= max(14, int(h2 * 0.11))
-                and h2 * 0.20 <= y_center <= h2 * 0.80
-                and x <= int(w2 * 0.22)
-            ):
-                return True
-        return False
-
-    has_leading_minus_shape = any(_looks_like_leading_minus(v) for v in variants)
-
-    def _normalize_numeric_token(token: str) -> str | None:
-        token = token.replace(",", ".").replace(" ", "")
-        token = re.sub(r"[^0-9.\-]", "", token)
-        if not token:
-            return None
-        if token.count("-") > 1:
-            token = token.replace("-", "")
-        if "-" in token and not token.startswith("-"):
-            token = "-" + token.replace("-", "")
-        if token.count(".") > 1:
-            first = token.find(".")
-            token = token[: first + 1] + token[first + 1 :].replace(".", "")
-        if token in {"-", ".", "-."}:
-            return None
-        return token
-
-    def _extract_numeric_token(text: str) -> str | None:
-        m = re.search(r"-?\d+(?:[.,]\d+)?", text)
-        if not m:
-            return None
-        return _normalize_numeric_token(m.group(0))
-
-    psm_modes = (7, 8, 6, 13)
-    raw_candidates: list[str] = []
-    best: tuple[float, float, str, str] | None = None
-
-    for img in variants:
-        for psm in psm_modes:
-            config = (
-                f"--oem 1 --psm {psm} "
-                "-c tessedit_char_whitelist=0123456789.- "
-                "-c classify_bln_numeric_mode=1"
-            )
-            raw = pytesseract.image_to_string(img, config=config).strip().replace(",", ".")
-            raw_candidates.append(raw)
-            token = _extract_numeric_token(raw)
-            if token is None:
-                continue
-            if has_leading_minus_shape and not token.startswith("-"):
-                token = "-" + token
-            try:
-                value = float(token)
-            except ValueError:
-                continue
-
-            score = 0.0
-            if len(token.replace("-", "")) >= 2:
-                score += 1.1
-            if "." in token:
-                score += 0.8
-            try:
-                data = pytesseract.image_to_data(img, config=config, output_type=pytesseract.Output.DICT)
-                conf_vals = [
-                    float(c)
-                    for c, t in zip(data.get("conf", []), data.get("text", []))
-                    if str(c).strip() not in {"", "-1"} and str(t).strip()
-                ]
-                if conf_vals:
-                    score += max(conf_vals) / 100.0
-            except Exception:
-                pass
-
-            if best is None or score > best[0]:
-                best = (score, value, token, raw)
-
-    if best is not None:
-        return CVResult(value=best[1], ok=True, ocr_raw=best[3], warnings=warnings or None)
-
-    joined = " | ".join(x for x in raw_candidates if x)
-    return CVResult(
-        value=None,
-        ok=False,
-        error=f"OCR segment failed: '{joined}'",
-        ocr_raw=joined,
-        warnings=warnings or None,
-    )
-
-
 def _angle_from_center(center: tuple[float, float], point: tuple[float, float]) -> float:
     dx = point[0] - center[0]
     dy = center[1] - point[1]
@@ -576,9 +413,13 @@ def _best_angle_radial_darkness(
     scores = np.zeros(360, dtype=np.float64)
     for a in range(360):
         scores[a] = _radial_darkness_mean(gray, center, r0, r1, float(a))
-        # Засечки и метки у 0 и 100 создают ложные пики — подавляем шире (±20°).
-        if _angle_diff_deg(float(a), min_angle) < 20.0 or _angle_diff_deg(float(a), max_angle) < 20.0:
-            scores[a] *= 0.30
+        # У min подавляем мягче, чтобы не терять реальный пик у нуля.
+        near_min = _angle_diff_deg(float(a), min_angle)
+        near_max = _angle_diff_deg(float(a), max_angle)
+        if near_min < 8.0:
+            scores[a] *= 0.82
+        if near_max < 10.0:
+            scores[a] *= 0.65
     smoothed = np.convolve(scores, np.ones(5, dtype=np.float64) / 5.0, mode="same")
     best_i = int(np.argmax(smoothed))
     peak = float(smoothed[best_i])
@@ -623,9 +464,13 @@ def _detect_analog_needle_tip(
     }
 
     mismatch_penalty_per_deg = 1.2
+    anti_min = min_angle + 180.0
+    near_min_zone = _angle_diff_deg(rad_angle, min_angle) <= NEAR_MIN_ZONE_DEG
     best_tip: tuple[float, float] | None = None
     best_score = -1e18
+    best_reason = "score"
     line_count = 0
+    candidates: list[dict[str, Any]] = []
 
     if lines is not None:
         line_count = int(len(lines))
@@ -638,16 +483,56 @@ def _detect_analog_needle_tip(
             center_to_segment = _point_to_segment_distance(center, p1, p2)
             if center_to_segment > near_center_thr:
                 continue
-            tip = p1 if d1 > d2 else p2
-            tip_len = max(d1, d2)
-            if tip_len < min_tip_len:
-                continue
-            tip_ang = _angle_from_center(center, tip)
-            mismatch = _angle_diff_deg(tip_ang, rad_angle)
-            score = tip_len - center_to_segment * 0.8 - mismatch * mismatch_penalty_per_deg
-            if score > best_score:
-                best_score = score
-                best_tip = tip
+            # Рассматриваем оба конца сегмента, чтобы не фиксироваться на хвосте.
+            for tip, tip_len in ((p1, d1), (p2, d2)):
+                if tip_len < min_tip_len:
+                    continue
+                tip_ang = _angle_from_center(center, tip)
+                mismatch = _angle_diff_deg(tip_ang, rad_angle)
+                min_diff = _angle_diff_deg(tip_ang, min_angle)
+                anti_min_diff = _angle_diff_deg(tip_ang, anti_min)
+                anti_min_penalty = 0.0
+                if anti_min_diff < ANTI_MIN_WINDOW_DEG:
+                    anti_min_penalty = (ANTI_MIN_WINDOW_DEG - anti_min_diff) * ANTI_MIN_PENALTY_BASE
+                    if near_min_zone:
+                        anti_min_penalty *= 1.35
+
+                score = (
+                    tip_len
+                    - center_to_segment * 0.8
+                    - mismatch * mismatch_penalty_per_deg
+                    - anti_min_penalty
+                )
+                is_min_side = min_diff + 2.0 < anti_min_diff
+                zero_zone_score = score
+                if near_min_zone:
+                    if is_min_side:
+                        zero_zone_score += max(0.0, ZERO_ZONE_MIN_BONUS - min_diff * 0.8)
+                    else:
+                        zero_zone_score -= max(0.0, ZERO_ZONE_ANTI_PENALTY - anti_min_diff * 0.7)
+
+                cand = {
+                    "tip": tip,
+                    "tip_len": float(tip_len),
+                    "tip_ang": float(tip_ang),
+                    "mismatch": float(mismatch),
+                    "dist_to_min": float(min_diff),
+                    "dist_to_anti_min": float(anti_min_diff),
+                    "score": float(score),
+                    "zero_zone_score": float(zero_zone_score),
+                    "is_min_side": bool(is_min_side),
+                }
+                candidates.append(cand)
+
+    if candidates:
+        if near_min_zone:
+            chosen = max(candidates, key=lambda c: c["zero_zone_score"])
+            best_reason = "near_min_disambiguation"
+        else:
+            chosen = max(candidates, key=lambda c: c["score"])
+            best_reason = "global_best_score"
+        best_tip = chosen["tip"]
+        best_score = float(chosen["score"])
 
     ray_len = max(min_tip_len, expected_len * 0.88)
     # ray_tip в пиксельных координатах: Y инвертирован (см. _radial_darkness_mean).
@@ -658,8 +543,43 @@ def _detect_analog_needle_tip(
     ray_base_score = rad_peak * 0.35
 
     if best_tip is None:
+        debug["near_min_zone"] = near_min_zone
+        debug["anti_min_angle"] = round(float(anti_min), 3)
+        debug["best_candidate_reason"] = "radial_only_no_hough_candidate"
         debug["needle_method"] = "radial_only"
         return ray_tip, ray_base_score, "radial_only", debug
+
+    min_compatible = [
+        c
+        for c in candidates
+        if c["is_min_side"] and c["dist_to_min"] <= MIN_COMPATIBLE_ANGLE_DEG
+    ]
+    min_compatible_best = max(min_compatible, key=lambda c: c["score"]) if min_compatible else None
+    top_candidates = sorted(
+        candidates,
+        key=lambda c: c["zero_zone_score"] if near_min_zone else c["score"],
+        reverse=True,
+    )[:3]
+    debug["near_min_zone"] = near_min_zone
+    debug["anti_min_angle"] = round(float(anti_min), 3)
+    debug["best_candidate_reason"] = best_reason
+    debug["top_candidates"] = [
+        {
+            "angle": round(float(c["tip_ang"]), 3),
+            "score": round(float(c["score"]), 3),
+            "zero_zone_score": round(float(c["zero_zone_score"]), 3),
+            "dist_to_min": round(float(c["dist_to_min"]), 3),
+            "dist_to_anti_min": round(float(c["dist_to_anti_min"]), 3),
+        }
+        for c in top_candidates
+    ]
+    if min_compatible_best is not None:
+        debug["min_compatible_tip"] = {
+            "x": round(float(min_compatible_best["tip"][0]), 3),
+            "y": round(float(min_compatible_best["tip"][1]), 3),
+            "angle": round(float(min_compatible_best["tip_ang"]), 3),
+            "dist_to_min": round(float(min_compatible_best["dist_to_min"]), 3),
+        }
 
     tip_ang = _angle_from_center(center, best_tip)
     if _angle_diff_deg(tip_ang, rad_angle) > 22.0:
@@ -713,7 +633,7 @@ def _recognize_analog(image: np.ndarray, calibration_data: dict[str, Any]) -> CV
         if lines is not None:
             break
 
-    best_tip, _score, needle_method, _ = _detect_analog_needle_tip(
+    best_tip, _score, needle_method, ndbg = _detect_analog_needle_tip(
         image, center, min_point, max_point, expected_len, near_center_thr, min_tip_len, lines
     )
     if needle_method == "radial_only":
@@ -728,8 +648,21 @@ def _recognize_analog(image: np.ndarray, calibration_data: dict[str, Any]) -> CV
     if best_tip is None:
         return CVResult(value=None, ok=False, error="Needle near center not found")
 
-    angle = _angle_from_center(center, best_tip)
+    # Post-check: если выбран кандидат в зоне anti-min, но радиальный пик у min,
+    # переключаемся на min-совместимого кандидата (если есть).
     min_angle = _angle_from_center(center, min_point)
+    selected_angle = _angle_from_center(center, best_tip)
+    anti_min_angle = min_angle + 180.0
+    if (
+        _angle_diff_deg(float(ndbg.get("radial_peak_angle", selected_angle)), min_angle) <= POSTCHECK_RADIAL_TO_MIN_DEG
+        and _angle_diff_deg(selected_angle, anti_min_angle) <= POSTCHECK_SELECTED_TO_ANTI_DEG
+        and isinstance(ndbg.get("min_compatible_tip"), dict)
+    ):
+        mtip = ndbg["min_compatible_tip"]
+        best_tip = (float(mtip["x"]), float(mtip["y"]))
+        warnings.append("anti_min_postcheck_replaced_with_min_side_tip")
+
+    angle = _angle_from_center(center, best_tip)
     max_angle = _angle_from_center(center, max_point)
     ratio, _span_used, arc_hint = _ratio_on_arc(min_angle, max_angle, angle)
     if arc_hint == "degenerate":
@@ -752,6 +685,10 @@ def analog_debug_from_image(image: np.ndarray, calibration_data: dict[str, Any])
         "radial_peak_angle": None,
         "radial_peak_strength": None,
         "needle_method": None,
+        "anti_min_angle": None,
+        "near_min_zone": None,
+        "best_candidate_reason": None,
+        "top_candidates": None,
         "warnings": [],
     }
 
@@ -800,6 +737,10 @@ def analog_debug_from_image(image: np.ndarray, calibration_data: dict[str, Any])
     out["radial_peak_angle"] = ndbg.get("radial_peak_angle")
     out["radial_peak_strength"] = ndbg.get("radial_peak_strength")
     out["needle_method"] = needle_method
+    out["anti_min_angle"] = ndbg.get("anti_min_angle")
+    out["near_min_zone"] = ndbg.get("near_min_zone")
+    out["best_candidate_reason"] = ndbg.get("best_candidate_reason")
+    out["top_candidates"] = ndbg.get("top_candidates")
     out["quality_score"] = round(float(best_score), 3)
 
     if needle_method == "radial_only":
@@ -816,8 +757,19 @@ def analog_debug_from_image(image: np.ndarray, calibration_data: dict[str, Any])
         out["warnings"] = [*out["warnings"], "needle_not_found", f"hough_lines={line_count}"]
         return out
 
-    angle = _angle_from_center(center, best_tip)
     min_angle = _angle_from_center(center, min_point)
+    selected_angle = _angle_from_center(center, best_tip)
+    anti_min_angle = min_angle + 180.0
+    if (
+        _angle_diff_deg(float(ndbg.get("radial_peak_angle", selected_angle)), min_angle) <= POSTCHECK_RADIAL_TO_MIN_DEG
+        and _angle_diff_deg(selected_angle, anti_min_angle) <= POSTCHECK_SELECTED_TO_ANTI_DEG
+        and isinstance(ndbg.get("min_compatible_tip"), dict)
+    ):
+        mtip = ndbg["min_compatible_tip"]
+        best_tip = (float(mtip["x"]), float(mtip["y"]))
+        out["warnings"] = [*out["warnings"], "anti_min_postcheck_replaced_with_min_side_tip"]
+
+    angle = _angle_from_center(center, best_tip)
     max_angle = _angle_from_center(center, max_point)
     ratio, span_used, arc_hint = _ratio_on_arc(min_angle, max_angle, angle)
     if arc_hint == "degenerate":
@@ -865,8 +817,6 @@ def recognize_from_image(
     _append_roi_geometry_warnings(roi_geom_warnings, roi_image, roi_data, image.shape)
     if logger.gauge_type == GaugeType.digital:
         return _merge_cv_warnings(_recognize_digital(roi_image), roi_geom_warnings)
-    if logger.gauge_type == GaugeType.digital_segment:
-        return _merge_cv_warnings(_recognize_digital_segment(roi_image), roi_geom_warnings)
     rx, ry = _roi_origin(roi_data)
     cal_roi = _calibration_to_roi_coords(calibration_data, rx, ry)
     return _merge_cv_warnings(_recognize_analog(roi_image, cal_roi), roi_geom_warnings)
