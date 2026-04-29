@@ -82,7 +82,7 @@ services:
     environment:
       APP_ENV: ${APP_ENV:-dev}
       APP_LOG_LEVEL: ${APP_LOG_LEVEL:-INFO}
-      APP_CORS_ORIGINS: ${APP_CORS_ORIGINS:-http://localhost:5173}
+      APP_CORS_ORIGINS: ${APP_CORS_ORIGINS:-http://localhost:5173,http://127.0.0.1:5173}
       APP_DATABASE_URL: ${APP_DATABASE_URL:-postgresql+asyncpg://gauges:gauges@postgres:5432/gauges}
       APP_REDIS_URL: ${APP_REDIS_URL:-redis://redis:6379/0}
       APP_STORAGE_DIR: ${APP_STORAGE_DIR:-/data}

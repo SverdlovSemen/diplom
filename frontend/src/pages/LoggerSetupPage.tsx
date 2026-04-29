@@ -35,13 +35,22 @@ type QualitySummary = {
 
 function qualityRecommendations(summary: QualitySummary): string[] {
   const tips: string[] = [];
-  if (summary.failCount > 0) tips.push("Reduce ROI to dial only; avoid background and labels.");
-  if (summary.rangeValue != null && summary.rangeValue < 0.5) tips.push("Needle likely locked on edge: re-place center/min/max points.");
-  if (summary.notes.some((n) => n.includes("needle_not_found"))) tips.push("Increase contrast or reduce glare, then recalibrate points.");
-  if (summary.notes.some((n) => n.includes("tip_outside_minmax_span"))) tips.push("Min/max points likely swapped or off-span.");
-  if (summary.notes.some((n) => n.includes("tip_from_dark_pixels_fallback"))) tips.push("Detector is using fallback often; tighten ROI and improve lighting.");
-  if (tips.length === 0) tips.push("Calibration quality looks good.");
+  const hasTooManyExtremes = summary.notes.includes("too_many_extreme_values");
+  if (summary.failCount > 0) tips.push("Сузьте ROI до шкалы, исключите фон и подписи.");
+  if (summary.rangeValue != null && summary.rangeValue < 0.3 && hasTooManyExtremes) {
+    tips.push("Стрелка вероятно залипает у края: переустановите center/min/max точки.");
+  }
+  if (summary.notes.some((n) => n.includes("needle_not_found"))) tips.push("Увеличьте контраст или уменьшите блики, затем перекалибруйте точки.");
+  if (summary.notes.some((n) => n.includes("tip_outside_minmax_span"))) tips.push("Точки min/max, вероятно, перепутаны или поставлены вне диапазона.");
+  if (summary.notes.some((n) => n.includes("tip_from_dark_pixels_fallback"))) tips.push("Детектор часто использует fallback: сузьте ROI и улучшите освещение.");
+  if (tips.length === 0) tips.push("Качество калибровки хорошее.");
   return tips;
+}
+
+function humanizeMeasurementError(error: string | null | undefined): string {
+  if (!error) return "неизвестно";
+  if (error.toLowerCase().includes("нереалистичный скачок")) return "измерение не принято";
+  return error;
 }
 
 function clamp(n: number, min: number, max: number): number {
@@ -147,7 +156,7 @@ export function LoggerSetupPage(): React.ReactElement {
       if (typeof parsedCal?.max_value === "number" && Number.isFinite(parsedCal.max_value)) setMaxScaleValue(parsedCal.max_value);
       setMeasurements((await listMeasurements({ loggerId, limit: 20 })).items);
     } catch (e) {
-      setError(e instanceof Error ? e.message : "Failed to load setup data");
+      setError(e instanceof Error ? e.message : "Не удалось загрузить данные настройки");
     }
   }, [loggerId]);
 
@@ -356,10 +365,10 @@ export function LoggerSetupPage(): React.ReactElement {
       } else {
         const parsedCal = JSON.parse(calibrationJson) as CalibrationData;
         if (!parsedCal.center || !parsedCal.min_point || !parsedCal.max_point) {
-          throw new Error("Calibration needs center, min_point and max_point");
+          throw new Error("Для калибровки нужны точки center, min_point и max_point");
         }
         if (typeof parsedCal.min_value !== "number" || typeof parsedCal.max_value !== "number") {
-          throw new Error("Calibration needs numeric min_value and max_value");
+          throw new Error("Для калибровки нужны числовые значения min_value и max_value");
         }
         await updateLogger(loggerId, {
           roi_json: roiJson,
@@ -367,13 +376,13 @@ export function LoggerSetupPage(): React.ReactElement {
           gauge_type: "analog",
         });
       }
-      setStatus("Configuration saved");
+      setStatus("Конфигурация сохранена");
       setLoadedRoiJson(roiJson);
       setCalibrationDirtyByRoi(false);
       setConfigSaved(true);
       await refresh();
     } catch (e) {
-      setError(e instanceof Error ? e.message : "Failed to save configuration");
+      setError(e instanceof Error ? e.message : "Не удалось сохранить конфигурацию");
     }
   }
 
@@ -385,10 +394,14 @@ export function LoggerSetupPage(): React.ReactElement {
       const m = await captureNow(loggerId);
       const rangeNote =
         m.out_of_range === true ? " · вне допустимого диапазона" : m.out_of_range === false ? " · в диапазоне" : "";
-      setStatus(m.ok ? `Captured: ${m.value ?? "n/a"} ${m.unit}${rangeNote}` : `Capture error: ${m.error ?? "unknown"}`);
+      setStatus(
+        m.ok
+          ? `Снимок получен: ${m.value ?? "н/д"} ${m.unit}${rangeNote}`
+          : `Ошибка захвата: ${humanizeMeasurementError(m.error)}`,
+      );
       await refresh();
     } catch (e) {
-      setError(e instanceof Error ? e.message : "Capture failed");
+      setError(e instanceof Error ? e.message : "Не удалось выполнить захват");
     }
   }
 
@@ -402,11 +415,11 @@ export function LoggerSetupPage(): React.ReactElement {
       const r = await testRecognize(loggerId, { production_parity: true });
       setTestResult(r);
       const line = r.ok
-        ? `Production parity: ${r.value ?? "n/a"} (frame_source=${r.frame_source ?? "?"})`
-        : `Production parity error: ${r.error ?? "unknown"}`;
+        ? `Сравнение с production: ${r.value ?? "н/д"} (источник кадра=${r.frame_source ?? "?"})`
+        : `Ошибка сравнения с production: ${humanizeMeasurementError(r.error)}`;
       setStatus(line);
     } catch (e) {
-      setError(e instanceof Error ? e.message : "Production parity test failed");
+      setError(e instanceof Error ? e.message : "Тест сравнения с production не выполнен");
     } finally {
       setTesting(false);
     }
@@ -429,18 +442,15 @@ export function LoggerSetupPage(): React.ReactElement {
         calibration_json: gaugeType === "analog" ? calibrationJson : undefined,
       });
       setTestResult(r);
-      let line = r.ok ? `Recognized: ${r.value ?? "n/a"}` : `Recognize error: ${r.error ?? "unknown"}`;
-      if (r.ocr_raw != null && r.ocr_raw !== "") {
-        line += ` · OCR raw: «${r.ocr_raw}»`;
-      }
+      let line = r.ok ? `Распознано: ${r.value ?? "н/д"}` : `Ошибка распознавания: ${humanizeMeasurementError(r.error)}`;
       if (r.frame_source === "client_jpeg") {
-        line += " (frame = current snapshot)";
+        line += " (кадр = текущий снимок)";
       } else if (r.frame_source === "rtmp_capture") {
-        line += " (new RTMP frame — refresh snapshot to match)";
+        line += " (новый RTMP-кадр — обновите снимок для сверки)";
       }
       setStatus(line);
     } catch (e) {
-      setError(e instanceof Error ? e.message : "Test recognize failed");
+      setError(e instanceof Error ? e.message : "Тест распознавания не выполнен");
     } finally {
       setTesting(false);
     }
@@ -449,7 +459,7 @@ export function LoggerSetupPage(): React.ReactElement {
   async function runQualityTestSeries(samples = 6): Promise<void> {
     if (!loggerId) return;
     if (gaugeType === "analog" && !calibrationReady) {
-      setError("Finish ROI + center/min/max + scale values (ROI must match saved frame if you changed ROI)");
+      setError("Завершите ROI + center/min/max + значения шкалы (ROI должен соответствовать сохраненному кадру после изменения)");
       return;
     }
     setQualityRunning(true);
@@ -486,7 +496,7 @@ export function LoggerSetupPage(): React.ReactElement {
       const fallbackCount = [...notes].filter((n) => n.includes("tip_from_dark_pixels_fallback")).length;
       const pass =
         okCount >= Math.max(5, Math.floor(samples * 0.8)) &&
-        (rangeV == null || rangeV > 0.5) &&
+        (rangeV == null || rangeV > 0.3) &&
         clippedRatio <= 0.6 &&
         fallbackCount <= 2;
       const summary: QualitySummary = {
@@ -501,9 +511,9 @@ export function LoggerSetupPage(): React.ReactElement {
         notes: [...notes].slice(0, 8),
       };
       setQualitySummary(summary);
-      setStatus(pass ? "Quality test passed" : "Quality test needs recalibration (see notes)");
+      setStatus(pass ? "Тест качества пройден" : "Тест качества требует перекалибровки (см. замечания)");
     } catch (e) {
-      setError(e instanceof Error ? e.message : "Quality test failed");
+      setError(e instanceof Error ? e.message : "Тест качества не выполнен");
     } finally {
       setQualityRunning(false);
     }
@@ -511,61 +521,129 @@ export function LoggerSetupPage(): React.ReactElement {
 
   return (
     <div className="space-y-4">
-      <h1 className="text-2xl font-semibold">Logger setup</h1>
+      <h1 className="text-2xl font-semibold">Настройка логера</h1>
 
-      <div className="rounded-lg border bg-white p-4 space-y-3">
-        <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
-          <div className="font-medium">ROI setup</div>
-          <label className="flex items-center gap-2 text-sm text-slate-700">
-            Gauge type
-            <select
-              className="rounded border px-2 py-1"
-              value={gaugeType}
-              onChange={(e) => {
-                setGaugeType(e.target.value as GaugeType);
-                setConfigSaved(false);
-              }}
-            >
-              <option value="analog">analog</option>
-              <option value="digital">digital</option>
-            </select>
-          </label>
+      <div className="rounded-lg border bg-white p-4 space-y-3 sticky top-2 z-10">
+        <div className="flex flex-col gap-2 lg:flex-row lg:items-center lg:justify-between">
+          <div className="font-medium">Панель настройки и тестов</div>
+          <div className="flex flex-wrap items-center gap-3">
+            <label className="flex items-center gap-2 text-sm text-slate-700">
+              Тип датчика
+              <select
+                className="rounded border px-2 py-1"
+                value={gaugeType}
+                onChange={(e) => {
+                  setGaugeType(e.target.value as GaugeType);
+                  setConfigSaved(false);
+                }}
+              >
+                <option value="analog">аналоговый</option>
+                <option value="digital">цифровой</option>
+              </select>
+            </label>
+            {gaugeType === "analog" ? (
+              <div className="flex items-center gap-2 text-sm">
+                <span className="text-slate-700">Шкала</span>
+                <input
+                  className="w-24 rounded border px-2 py-1"
+                  type="number"
+                  value={minScaleValue}
+                  onChange={(e) => setMinScaleValue(Number(e.target.value))}
+                  placeholder="min"
+                />
+                <span className="text-slate-500">→</span>
+                <input
+                  className="w-24 rounded border px-2 py-1"
+                  type="number"
+                  value={maxScaleValue}
+                  onChange={(e) => setMaxScaleValue(Number(e.target.value))}
+                  placeholder="max"
+                />
+              </div>
+            ) : null}
+          </div>
         </div>
-        <p className="text-xs text-slate-600 max-w-3xl">
-          «Test recognize» использует кадр из снимка и при необходимости несохранённые ROI/калибровку из полей ниже. «Test as production» вызывает тот же путь CV, что и фоновый процесс: RTMP + только данные из БД после Save config (
-          <span className="font-mono">production_parity</span>).
-        </p>
         <div className="flex flex-wrap gap-2">
-            <button className="rounded border px-3 py-2 text-sm" onClick={() => setSnapshotTs(Date.now())}>
-              Refresh snapshot
-            </button>
+          <button
+            className="rounded border px-3 py-2 text-sm"
+            onClick={() => setSnapshotTs(Date.now())}
+            title="Запрашивает новый snapshot из RTMP и обновляет изображение на экране."
+          >
+            Обновить снимок
+          </button>
+          <button
+            className="rounded border px-3 py-2 text-sm"
+            onClick={() => void runTestRecognize()}
+            title="Проверяет распознавание по текущему снимку/настройкам из UI. В БД не записывает."
+            disabled={
+              testing ||
+              snapshotLoading ||
+              !snapshotObjectUrl ||
+              (gaugeType === "analog" && !calibrationReady)
+            }
+          >
+            {testing ? "Тест..." : "Тест распознавания"}
+          </button>
+          <button
+            className="rounded border border-slate-900 px-3 py-2 text-sm font-medium"
+            type="button"
+            title="Проверяет боевой путь: новый кадр RTMP + только сохраненные настройки из БД. В БД не записывает."
+            onClick={() => void runTestRecognizeProductionParity()}
+            disabled={testing || !configSaved || calibrationDirtyByRoi}
+          >
+            {testing ? "Тест..." : "Тест как в production"}
+          </button>
+          {gaugeType === "analog" ? (
             <button
               className="rounded border px-3 py-2 text-sm"
-              onClick={() => void runTestRecognize()}
-              disabled={
-                testing ||
-                snapshotLoading ||
-                !snapshotObjectUrl ||
-                (gaugeType === "analog" && !calibrationReady)
-              }
+              onClick={() => void runQualityTestSeries(6)}
+              title="Запускает 6 быстрых распознаваний подряд, оценивает стабильность и выводит рекомендации. В БД не записывает."
+              disabled={qualityRunning || !calibrationReady}
             >
-              {testing ? "Testing…" : "Test recognize"}
+              {qualityRunning ? "Качество..." : "Качество x6"}
             </button>
-            <button
-              className="rounded border border-slate-900 px-3 py-2 text-sm font-medium"
-              type="button"
-              title="Тот же recognize_from_image(image, logger), что и у фонового воркера; нужны сохранённые ROI/калибровка"
-              onClick={() => void runTestRecognizeProductionParity()}
-              disabled={testing || !configSaved || calibrationDirtyByRoi}
-            >
-              {testing ? "Testing…" : "Test as production"}
-            </button>
-            {gaugeType === "analog" ? (
-              <button className="rounded border px-3 py-2 text-sm" onClick={() => void runQualityTestSeries(6)} disabled={qualityRunning || !calibrationReady}>
-                {qualityRunning ? "Quality…" : "Quality x6"}
-              </button>
-            ) : null}
+          ) : null}
+          <button
+            className="rounded bg-slate-900 px-3 py-2 text-sm text-white disabled:opacity-50"
+            onClick={() => void saveConfig()}
+            title="Сохраняет текущие ROI/калибровку в БД. После этого их использует production-пайплайн."
+            disabled={gaugeType === "analog" ? !hasRoi || !hasCenter || !hasMin || !hasMax || !hasScale : !hasRoi}
+          >
+            Сохранить конфигурацию
+          </button>
+          <button
+            className="rounded border px-3 py-2 text-sm"
+            onClick={() => void runTestCapture()}
+            title="Делает боевой захват и сохраняет измерение в БД (появится в списке последних измерений)."
+          >
+            Тестовый захват
+          </button>
         </div>
+        <details className="rounded border bg-slate-50 px-3 py-2 text-xs text-slate-700">
+          <summary className="cursor-pointer font-medium text-sm">Шпаргалка по кнопкам</summary>
+          <div className="mt-2 space-y-1">
+            <div><span className="font-medium">Обновить снимок:</span> новый кадр на экране, без записи в БД.</div>
+            <div><span className="font-medium">Тест распознавания:</span> тест по текущему UI-снимку/настройкам, без записи в БД.</div>
+            <div><span className="font-medium">Тест как в production:</span> тест как у фонового воркера (RTMP + настройки из БД), без записи в БД.</div>
+            {gaugeType === "analog" ? (
+              <div><span className="font-medium">Качество x6:</span> 6 распознаваний подряд, проверка стабильности и подсказки по калибровке.</div>
+            ) : null}
+            <div><span className="font-medium">Сохранить конфигурацию:</span> записывает ROI/калибровку в БД.</div>
+            <div><span className="font-medium">Тестовый захват:</span> боевой прогон с записью измерения в БД.</div>
+          </div>
+        </details>
+        <div className="grid gap-2 lg:grid-cols-2">
+          <div className="rounded border bg-slate-50 px-3 py-2 text-sm text-slate-700 min-h-11 flex items-center">
+            {status ?? "Результат операций будет показан здесь"}
+          </div>
+          <div className={`rounded border px-3 py-2 text-sm min-h-11 flex items-center ${error ? "border-red-300 bg-red-50 text-red-700" : "border-slate-200 bg-slate-50 text-slate-500"}`}>
+            {error ?? "Ошибок нет"}
+          </div>
+        </div>
+      </div>
+
+      <div className="rounded-lg border bg-white p-4 space-y-3">
+        <div className="font-medium">Настройка ROI и калибровки</div>
         {gaugeType === "analog" ? (
           <div className="flex flex-wrap gap-2">
             <button className={`rounded border px-3 py-1.5 text-xs ${toolMode === "roi" ? "bg-slate-900 text-white" : ""}`} onClick={() => setToolMode("roi")}>
@@ -576,43 +654,51 @@ export function LoggerSetupPage(): React.ReactElement {
               onClick={() => setToolMode("center")}
               disabled={!hasRoi}
             >
-              2) Center
+              2) Центр
             </button>
             <button
               className={`rounded border px-3 py-1.5 text-xs ${toolMode === "min" ? "bg-slate-900 text-white" : ""}`}
               onClick={() => setToolMode("min")}
               disabled={!hasCenter}
             >
-              3) Min point
+              3) Точка min
             </button>
             <button
               className={`rounded border px-3 py-1.5 text-xs ${toolMode === "max" ? "bg-slate-900 text-white" : ""}`}
               onClick={() => setToolMode("max")}
               disabled={!hasMin}
             >
-              4) Max point
+              4) Точка max
             </button>
           </div>
         ) : null}
         <div className="text-sm text-slate-600">
           {gaugeType === "analog"
-            ? `${toolMode === "roi" ? "Drag on the image to select ROI." : "Click on the image to place calibration point."} Then click “Save config”.`
-            : "Drag on the image to select ROI. Then click “Save config”."}
+            ? `${toolMode === "roi" ? "Перетащите по изображению, чтобы выбрать ROI." : "Кликните по изображению, чтобы установить точку калибровки."} Затем нажмите «Сохранить конфигурацию».`
+            : "Перетащите по изображению, чтобы выбрать ROI. Затем нажмите «Сохранить конфигурацию»."}
         </div>
         {gaugeType === "analog" ? (
           <div className="rounded border bg-blue-50 px-3 py-2 text-xs text-blue-900">
-            Current step: {recommendedTool === "roi" ? "Select ROI" : recommendedTool === "center" ? "Click center" : recommendedTool === "min" ? "Click minimum point" : "Click maximum point"}
+            Текущий шаг:{" "}
+            {recommendedTool === "roi"
+              ? "Выберите ROI"
+              : recommendedTool === "center"
+                ? "Укажите центр"
+                : recommendedTool === "min"
+                  ? "Укажите минимальную точку"
+                  : "Укажите максимальную точку"}
           </div>
         ) : null}
         {gaugeType === "analog" ? (
           <div className="rounded border bg-slate-50 px-3 py-2 text-xs text-slate-700">
-            Steps: ROI {hasRoi ? "OK" : "TODO"} {"->"} Center {hasCenter ? "OK" : "TODO"} {"->"} Min {hasMin ? "OK" : "TODO"} {"->"} Max{" "}
-            {hasMax ? "OK" : "TODO"} {"->"} Scale {hasScale ? "OK" : "TODO"} {"->"} Save {configSaved && !calibrationDirtyByRoi ? "OK" : "TODO"}.
+            Шаги: ROI {hasRoi ? "ОК" : "TODO"} {"->"} Центр {hasCenter ? "ОК" : "TODO"} {"->"} Min {hasMin ? "ОК" : "TODO"} {"->"} Max{" "}
+            {hasMax ? "ОК" : "TODO"} {"->"} Шкала {hasScale ? "ОК" : "TODO"} {"->"} Сохранить{" "}
+            {configSaved && !calibrationDirtyByRoi ? "ОК" : "TODO"}.
           </div>
         ) : null}
         {gaugeType === "analog" && calibrationDirtyByRoi ? (
           <div className="rounded border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-900">
-            ROI changed since last save. Calibration points may be invalid for this ROI - place points again and save config.
+            ROI изменился после последнего сохранения. Точки калибровки могут быть недействительны для этого ROI — укажите точки заново и сохраните конфигурацию.
           </div>
         ) : null}
 
@@ -639,7 +725,7 @@ export function LoggerSetupPage(): React.ReactElement {
               alt="snapshot"
               className="max-w-full rounded border bg-slate-50"
               onError={() => {
-                setSnapshotLoadError("Браузер не смог показать снимок. Нажмите «Refresh snapshot».");
+                setSnapshotLoadError("Браузер не смог показать снимок. Нажмите «Обновить снимок».");
                 setSnapshotObjectUrl((prev) => {
                   if (prev) URL.revokeObjectURL(prev);
                   return null;
@@ -680,7 +766,7 @@ export function LoggerSetupPage(): React.ReactElement {
               const sy = r.height / imgDims.h;
               const left = centerPoint.x * sx - 6;
               const top = centerPoint.y * sy - 6;
-              return <div className="absolute h-3 w-3 rounded-full bg-blue-600" style={{ left, top }} title="center" />;
+              return <div className="absolute h-3 w-3 rounded-full bg-blue-600" style={{ left, top }} title="центр" />;
             })()
           ) : null}
           {gaugeType === "analog" && imgRef.current && imgDims && minPoint ? (
@@ -691,7 +777,7 @@ export function LoggerSetupPage(): React.ReactElement {
               const sy = r.height / imgDims.h;
               const left = minPoint.x * sx - 6;
               const top = minPoint.y * sy - 6;
-              return <div className="absolute h-3 w-3 rounded-full bg-red-600" style={{ left, top }} title="min point" />;
+              return <div className="absolute h-3 w-3 rounded-full bg-red-600" style={{ left, top }} title="точка min" />;
             })()
           ) : null}
           {gaugeType === "analog" && imgRef.current && imgDims && maxPoint ? (
@@ -702,7 +788,7 @@ export function LoggerSetupPage(): React.ReactElement {
               const sy = r.height / imgDims.h;
               const left = maxPoint.x * sx - 6;
               const top = maxPoint.y * sy - 6;
-              return <div className="absolute h-3 w-3 rounded-full bg-violet-600" style={{ left, top }} title="max point" />;
+              return <div className="absolute h-3 w-3 rounded-full bg-violet-600" style={{ left, top }} title="точка max" />;
             })()
           ) : null}
           {gaugeType === "analog" && imgRef.current && imgDims && testResult?.analog_debug?.tip_point ? (
@@ -717,7 +803,7 @@ export function LoggerSetupPage(): React.ReactElement {
               const tipFull = tipPointToFullImage(tip, roi);
               const left = tipFull.x * sx - 5;
               const top = tipFull.y * sy - 5;
-              return <div className="absolute h-2.5 w-2.5 rounded-full bg-emerald-600" style={{ left, top }} title="detected tip" />;
+              return <div className="absolute h-2.5 w-2.5 rounded-full bg-emerald-600" style={{ left, top }} title="обнаруженный кончик стрелки" />;
             })()
           ) : null}
           {gaugeType === "analog" && imgRef.current && imgDims ? (
@@ -752,7 +838,7 @@ export function LoggerSetupPage(): React.ReactElement {
 
         {testResult?.roi_image ? (
           <div className="space-y-2">
-            <div className="text-sm font-medium text-slate-700">ROI preview (cropped)</div>
+            <div className="text-sm font-medium text-slate-700">Предпросмотр ROI (вырезка)</div>
             <img
               className="rounded border bg-slate-50"
               alt="roi"
@@ -762,41 +848,28 @@ export function LoggerSetupPage(): React.ReactElement {
         ) : null}
         {testResult?.analog_debug ? (
           <div className="rounded border bg-slate-50 p-3 text-xs text-slate-700 space-y-1">
-            <div>Analog debug: ratio={String(testResult.analog_debug.ratio ?? "n/a")} angle={String(testResult.analog_debug.angle ?? "n/a")}</div>
-            <div>min_angle={String(testResult.analog_debug.min_angle ?? "n/a")} max_angle={String(testResult.analog_debug.max_angle ?? "n/a")} score={String(testResult.analog_debug.quality_score ?? "n/a")}</div>
-            <div>warnings: {(testResult.analog_debug.warnings ?? []).join(", ") || "none"}</div>
-          </div>
-        ) : null}
-        {(testResult?.cv_warnings?.length ?? 0) > 0 ? (
-          <div className="rounded border border-amber-200 bg-amber-50 p-3 text-xs text-amber-950 space-y-1">
-            <div className="font-medium">Предупреждения ROI / CV (ТЗ п.12, вариант 1)</div>
-            <ul className="list-disc pl-4 space-y-0.5 font-mono">
-              {(testResult?.cv_warnings ?? []).map((w) => (
-                <li key={w}>{w}</li>
-              ))}
-            </ul>
-            <div className="text-slate-600 normal-case">
-              Пустой кроп — ошибка; мелкая зона или почти весь кадр — предупреждения. См. docs/tz_p12_detection_variant1_operator_roi.md
-            </div>
+            <div>Отладка аналога: ratio={String(testResult.analog_debug.ratio ?? "н/д")} angle={String(testResult.analog_debug.angle ?? "н/д")}</div>
+            <div>min_angle={String(testResult.analog_debug.min_angle ?? "н/д")} max_angle={String(testResult.analog_debug.max_angle ?? "н/д")} score={String(testResult.analog_debug.quality_score ?? "н/д")}</div>
+            <div>предупреждения: {(testResult.analog_debug.warnings ?? []).join(", ") || "нет"}</div>
           </div>
         ) : null}
           {gaugeType === "analog" && qualitySummary ? (
           <div className={`rounded border p-3 text-xs space-y-1 ${qualitySummary.pass ? "border-emerald-200 bg-emerald-50 text-emerald-900" : "border-amber-200 bg-amber-50 text-amber-900"}`}>
-            <div>Quality gate: {qualitySummary.pass ? "PASS" : "RECALIBRATE"}</div>
+            <div>Проверка качества: {qualitySummary.pass ? "ПРОЙДЕНО" : "ПЕРЕКАЛИБРОВАТЬ"}</div>
             <div>samples={qualitySummary.samples}, ok={qualitySummary.okCount}, fail={qualitySummary.failCount}</div>
             <div>min={String(qualitySummary.minValue ?? "n/a")} max={String(qualitySummary.maxValue ?? "n/a")} mean={String(qualitySummary.meanValue ?? "n/a")} range={String(qualitySummary.rangeValue ?? "n/a")}</div>
-            <div>notes: {qualitySummary.notes.join(", ") || "none"}</div>
-            <div>actions: {qualityRecommendations(qualitySummary).join(" | ")}</div>
+            <div>заметки: {qualitySummary.notes.join(", ") || "нет"}</div>
+            <div>действия: {qualityRecommendations(qualitySummary).join(" | ")}</div>
           </div>
         ) : null}
       </div>
 
       <div className="rounded-lg border bg-white p-4 space-y-3">
         <div className="text-sm text-slate-600">
-          Logger ID: <span className="font-mono">{loggerId}</span>
+          ID логера: <span className="font-mono">{loggerId}</span>
         </div>
         <details className="rounded border bg-slate-50 p-3">
-          <summary className="cursor-pointer text-sm font-medium">Advanced: ROI JSON</summary>
+          <summary className="cursor-pointer text-sm font-medium">Расширенно: ROI JSON</summary>
           <textarea
             className="mt-2 w-full rounded border p-2 font-mono text-xs"
             rows={5}
@@ -805,91 +878,50 @@ export function LoggerSetupPage(): React.ReactElement {
           />
         </details>
         {gaugeType === "analog" ? (
-          <>
-            <label className="block">
-              <span className="text-sm font-medium">Scale values</span>
-              <div className="mt-1 grid grid-cols-2 gap-2">
-                <input
-                  className="rounded border p-2 text-sm"
-                  type="number"
-                  value={minScaleValue}
-                  onChange={(e) => setMinScaleValue(Number(e.target.value))}
-                  placeholder="min value"
-                />
-                <input
-                  className="rounded border p-2 text-sm"
-                  type="number"
-                  value={maxScaleValue}
-                  onChange={(e) => setMaxScaleValue(Number(e.target.value))}
-                  placeholder="max value"
-                />
-              </div>
-            </label>
-            <label className="block">
-              <span className="text-sm font-medium">Calibration JSON</span>
-              <textarea
-                className="mt-1 w-full rounded border p-2 font-mono text-xs"
-                rows={7}
-                value={calibrationJson}
-                onChange={(e) => {
-                  const txt = e.target.value;
-                  setCalibrationJson(txt);
-                  const parsed = safeParseCalibrationJson(txt);
-                  if (!parsed) return;
-                  setCenterPoint(parsed.center ?? null);
-                  setMinPoint(parsed.min_point ?? null);
-                  setMaxPoint(parsed.max_point ?? null);
-                  if (typeof parsed.min_value === "number" && Number.isFinite(parsed.min_value)) setMinScaleValue(parsed.min_value);
-                  if (typeof parsed.max_value === "number" && Number.isFinite(parsed.max_value)) setMaxScaleValue(parsed.max_value);
-                }}
-              />
-            </label>
-          </>
+          <label className="block">
+            <span className="text-sm font-medium">Калибровка JSON</span>
+            <textarea
+              className="mt-1 w-full rounded border p-2 font-mono text-xs"
+              rows={7}
+              value={calibrationJson}
+              onChange={(e) => {
+                const txt = e.target.value;
+                setCalibrationJson(txt);
+                const parsed = safeParseCalibrationJson(txt);
+                if (!parsed) return;
+                setCenterPoint(parsed.center ?? null);
+                setMinPoint(parsed.min_point ?? null);
+                setMaxPoint(parsed.max_point ?? null);
+                if (typeof parsed.min_value === "number" && Number.isFinite(parsed.min_value)) setMinScaleValue(parsed.min_value);
+                if (typeof parsed.max_value === "number" && Number.isFinite(parsed.max_value)) setMaxScaleValue(parsed.max_value);
+              }}
+            />
+          </label>
         ) : null}
-        <div className="flex gap-2">
-          <button
-            className="rounded bg-slate-900 px-3 py-2 text-sm text-white disabled:opacity-50"
-            onClick={() => void saveConfig()}
-            disabled={gaugeType === "analog" ? !hasRoi || !hasCenter || !hasMin || !hasMax || !hasScale : !hasRoi}
-          >
-            Save config
-          </button>
-          <button className="rounded border px-3 py-2 text-sm" onClick={() => void runTestCapture()}>
-            Test capture now
-          </button>
-        </div>
-        {status ? <div className="text-sm text-green-700">{status}</div> : null}
-        {error ? <div className="text-sm text-red-700">{error}</div> : null}
       </div>
 
       <div className="rounded-lg border bg-white">
-        <div className="border-b px-4 py-3 text-sm font-medium text-slate-700">Last measurements</div>
+        <div className="border-b px-4 py-3 text-sm font-medium text-slate-700">Последние измерения</div>
         <div className="divide-y">
           {measurements.map((m) => (
             <div key={m.id} className="px-4 py-3 text-sm">
               <div>
-                {m.ok ? `${m.value ?? "n/a"} ${m.unit}` : `Error: ${m.error ?? "unknown"}`}
+                {m.ok ? `${m.value ?? "н/д"} ${m.unit}` : `Ошибка: ${humanizeMeasurementError(m.error)}`}
                 {m.out_of_range === true ? (
                   <span className="text-amber-800 font-medium"> · вне допустимого диапазона</span>
                 ) : m.out_of_range === false ? (
                   <span className="text-slate-500"> · в диапазоне</span>
                 ) : null}
-                {m.cv_warnings_json ? (
-                  <span className="text-xs text-slate-500" title={m.cv_warnings_json}>
-                    {" "}
-                    CV: {m.cv_warnings_json}
-                  </span>
-                ) : null}{" "}
                 · {new Date(m.captured_at).toLocaleString()}
               </div>
               {m.image_path ? (
                 <a className="underline underline-offset-4" target="_blank" rel="noreferrer" href={buildMediaUrl(m.image_path)}>
-                  Open image
+                  Открыть изображение
                 </a>
               ) : null}
             </div>
           ))}
-          {measurements.length === 0 ? <div className="px-4 py-3 text-slate-600">No measurements yet.</div> : null}
+          {measurements.length === 0 ? <div className="px-4 py-3 text-slate-600">Измерений пока нет.</div> : null}
         </div>
       </div>
     </div>

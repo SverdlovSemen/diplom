@@ -8,6 +8,7 @@ import tempfile
 import uuid
 import xml.etree.ElementTree as ET
 from contextlib import suppress
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from dataclasses import dataclass
@@ -33,11 +34,14 @@ from app.services.loggers import (
 # Повторная запись «конфиг не готов» в БД не чаще, чем раз в минуту при неизменной ошибке.
 CONFIG_INCOMPLETE_GAP_THROTTLE_SEC = 60.0
 from app.services.measurements import get_last_measurement_for_logger
+from app.services.measurements import get_recent_measurements_for_logger
 
 logger = logging.getLogger("app.processing")
 _last_retention_cleanup_at: datetime | None = None
 _RETENTION_CLEANUP_PERIOD_SEC = 300
 _RETENTION_BATCH_SIZE = 500
+ANOMALY_CONFIRMATION_FRAMES = 2
+RECENT_MEASUREMENTS_LOOKBACK = 8
 
 
 def _out_of_range_for_logger(target: Logger, value: float | None) -> bool | None:
@@ -56,6 +60,44 @@ def _cv_warnings_json(cv_result: CVResult) -> str | None:
     if cv_result.warnings:
         return json.dumps(cv_result.warnings)
     return None
+
+
+def _append_cv_warning(cv_result: CVResult, warning: str) -> CVResult:
+    warnings = list(cv_result.warnings or [])
+    warnings.append(warning)
+    return replace(cv_result, warnings=warnings)
+
+
+def _range_bounds(target: Logger) -> tuple[float, float] | None:
+    lo, hi = target.min_value, target.max_value
+    if lo is None or hi is None:
+        return None
+    a, b = (float(lo), float(hi)) if lo <= hi else (float(hi), float(lo))
+    return a, b
+
+
+def _value_out_of_range(bounds: tuple[float, float] | None, value: float | None) -> bool | None:
+    if value is None or bounds is None:
+        return None
+    a, b = bounds
+    return not (a <= float(value) <= b)
+
+
+def _consecutive_out_of_range_streak(
+    *,
+    measurements_desc: list[Measurement],
+    bounds: tuple[float, float] | None,
+) -> int:
+    streak = 0
+    for m in measurements_desc:
+        if not m.ok or m.value is None:
+            break
+        is_oof = _value_out_of_range(bounds, float(m.value))
+        if is_oof is True:
+            streak += 1
+            continue
+        break
+    return streak
 
 
 # Повторы и fallback нужны: live RTMP из nginx-rtmp часто даёт ffmpeg «Input/output error» на первом коннекте.
@@ -300,6 +342,15 @@ async def process_logger_once(session: AsyncSession, logger_id: uuid.UUID) -> Me
     if image is None:
         raise RuntimeError("Failed to read captured frame")
     cv_result = recognize_from_image(image, target)
+    bounds = _range_bounds(target)
+    recent = await get_recent_measurements_for_logger(session, target.id, limit=RECENT_MEASUREMENTS_LOOKBACK)
+    raw_out_of_range = _value_out_of_range(bounds, cv_result.value)
+    effective_out_of_range = raw_out_of_range
+    if raw_out_of_range is True and cv_result.ok:
+        prev_streak = _consecutive_out_of_range_streak(measurements_desc=recent, bounds=bounds)
+        if prev_streak + 1 < ANOMALY_CONFIRMATION_FRAMES:
+            effective_out_of_range = False
+            cv_result = _append_cv_warning(cv_result, "out_of_range_pending_confirmation")
 
     measurement = Measurement(
         logger_id=target.id,
@@ -307,7 +358,7 @@ async def process_logger_once(session: AsyncSession, logger_id: uuid.UUID) -> Me
         unit=target.unit,
         ok=cv_result.ok,
         error=cv_result.error,
-        out_of_range=_out_of_range_for_logger(target, cv_result.value),
+        out_of_range=effective_out_of_range,
         cv_warnings_json=_cv_warnings_json(cv_result),
         image_path=str(relative).replace("\\", "/"),
         captured_at=now,

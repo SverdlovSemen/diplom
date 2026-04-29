@@ -1,13 +1,15 @@
 import React from "react";
 import { Navigate, useLocation } from "react-router-dom";
 
-import { getMe, login as apiLogin, type AuthUser, type UserRole } from "../api/auth";
+import { getMe, login as apiLogin, register as apiRegister, type AuthUser, type UserRole } from "../api/auth";
 import { AUTH_TOKEN_KEY, getStoredAccessToken } from "../api/client";
 
 type AuthContextValue = {
   user: AuthUser | null;
   loading: boolean;
   login: (email: string, password: string) => Promise<void>;
+  register: (email: string, password: string) => Promise<void>;
+  refreshMe: () => Promise<void>;
   logout: () => void;
 };
 
@@ -42,12 +44,23 @@ export function AuthProvider({ children }: { children: React.ReactNode }): React
     setUser(res.user);
   }, []);
 
+  const register = React.useCallback(async (email: string, password: string) => {
+    const res = await apiRegister(email, password);
+    window.localStorage.setItem(AUTH_TOKEN_KEY, res.access_token);
+    setUser(res.user);
+  }, []);
+
+  const refreshMe = React.useCallback(async () => {
+    const me = await getMe();
+    setUser(me);
+  }, []);
+
   const logout = React.useCallback(() => {
     window.localStorage.removeItem(AUTH_TOKEN_KEY);
     setUser(null);
   }, []);
 
-  return <AuthContext.Provider value={{ user, loading, login, logout }}>{children}</AuthContext.Provider>;
+  return <AuthContext.Provider value={{ user, loading, login, register, refreshMe, logout }}>{children}</AuthContext.Provider>;
 }
 
 export function useAuth(): AuthContextValue {
@@ -59,7 +72,7 @@ export function useAuth(): AuthContextValue {
 export function RequireAuth({ children }: { children: React.ReactElement }): React.ReactElement {
   const { user, loading } = useAuth();
   const location = useLocation();
-  if (loading) return <div className="p-6 text-sm text-slate-600">Loading session...</div>;
+  if (loading) return <div className="p-6 text-sm text-slate-600">Загрузка сессии...</div>;
   if (!user) return <Navigate to="/login" replace state={{ from: location.pathname }} />;
   return children;
 }
@@ -72,7 +85,7 @@ export function RequireRole({
   role: UserRole;
 }): React.ReactElement {
   const { user, loading } = useAuth();
-  if (loading) return <div className="p-6 text-sm text-slate-600">Loading session...</div>;
+  if (loading) return <div className="p-6 text-sm text-slate-600">Загрузка сессии...</div>;
   if (!user) return <Navigate to="/login" replace />;
   if (user.role !== role) return <Navigate to="/dashboard" replace />;
   return children;

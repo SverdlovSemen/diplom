@@ -1,4 +1,4 @@
-import { apiFetch } from "./client";
+import { apiFetch, getStoredAccessToken } from "./client";
 
 export type Measurement = {
   id: string;
@@ -119,15 +119,24 @@ export async function listMeasurementAlerts(
 
 const apiBaseUrl = (import.meta.env.VITE_API_BASE_URL as string | undefined) ?? "http://localhost:8000";
 
-/** Скачать CSV (GET /api/v1/measurements/export.csv), те же фильтры, что у списка/сводки. */
-export async function downloadMeasurementsCsv(params?: MeasurementStatsParams): Promise<void> {
+export type MeasurementExportFormat = "csv" | "xlsx" | "pdf";
+
+/** Скачать файл экспорта (CSV/XLSX/PDF), те же фильтры, что у списка/сводки. */
+export async function downloadMeasurementsExport(
+  format: MeasurementExportFormat,
+  params?: MeasurementStatsParams,
+): Promise<void> {
   const q = new URLSearchParams();
   if (params?.loggerId) q.set("logger_id", params.loggerId);
   if (params?.from) q.set("from", params.from);
   if (params?.to) q.set("to", params.to);
-  const res = await fetch(`${apiBaseUrl}/api/v1/measurements/export.csv?${q.toString()}`, {
+  const token = getStoredAccessToken();
+  const res = await fetch(`${apiBaseUrl}/api/v1/measurements/export.${format}?${q.toString()}`, {
     method: "GET",
-    headers: { Accept: "text/csv, */*" },
+    headers: {
+      Accept: "*/*",
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+    },
   });
   if (!res.ok) {
     let msg = `${res.status} ${res.statusText}`;
@@ -141,12 +150,16 @@ export async function downloadMeasurementsCsv(params?: MeasurementStatsParams): 
   }
   const blob = await res.blob();
   const a = document.createElement("a");
-  const name = `measurements_export_${new Date().toISOString().slice(0, 19).replace(/[:.]/g, "-")}.csv`;
+  const name = `measurements_export_${new Date().toISOString().slice(0, 19).replace(/[:.]/g, "-")}.${format}`;
   a.href = URL.createObjectURL(blob);
   a.download = name;
   a.rel = "noopener";
   a.click();
   URL.revokeObjectURL(a.href);
+}
+
+export async function downloadMeasurementsCsv(params?: MeasurementStatsParams): Promise<void> {
+  await downloadMeasurementsExport("csv", params);
 }
 
 export async function captureNow(loggerId: string): Promise<Measurement> {

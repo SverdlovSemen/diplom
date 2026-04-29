@@ -1,7 +1,8 @@
 import React from "react";
-import { Navigate, useLocation } from "react-router-dom";
+import { Link, Navigate, useLocation } from "react-router-dom";
 
 import { useAuth } from "../auth/AuthContext";
+import { FeedbackBanner } from "../ui/feedback";
 
 export function LoginPage(): React.ReactElement {
   const { user, login } = useAuth();
@@ -21,7 +22,7 @@ export function LoginPage(): React.ReactElement {
     try {
       await login(email, password);
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Login failed");
+      setError(err instanceof Error ? err.message : "Не удалось выполнить вход");
     } finally {
       setLoading(false);
     }
@@ -29,16 +30,16 @@ export function LoginPage(): React.ReactElement {
 
   return (
     <div className="mx-auto mt-20 max-w-md rounded-lg border bg-white p-6 shadow-sm">
-      <h1 className="text-2xl font-semibold">Sign in</h1>
-      <p className="mt-1 text-sm text-slate-600">Admin / Viewer access</p>
-      {error ? <div className="mt-4 rounded-md border border-red-200 bg-red-50 p-2 text-sm text-red-800">{error}</div> : null}
+      <h1 className="text-2xl font-semibold">Вход</h1>
+      <p className="mt-1 text-sm text-slate-600">Доступ для админа и наблюдателя</p>
+      {error ? <div className="mt-4"><FeedbackBanner tone="error" message={error} /></div> : null}
       <form className="mt-4 space-y-3" onSubmit={(e) => void onSubmit(e)}>
         <input
           className="w-full rounded border px-3 py-2"
           type="email"
           value={email}
           onChange={(e) => setEmail(e.target.value)}
-          placeholder="email"
+          placeholder="Электронная почта"
           required
         />
         <input
@@ -46,17 +47,23 @@ export function LoginPage(): React.ReactElement {
           type="password"
           value={password}
           onChange={(e) => setPassword(e.target.value)}
-          placeholder="password"
+          placeholder="Пароль"
           required
         />
         <button
-          className="w-full rounded-md bg-slate-900 px-3 py-2 text-sm font-medium text-white hover:bg-slate-800 disabled:opacity-50"
+          className="w-full rounded-md bg-slate-900 px-3 py-2 text-sm font-medium text-white hover:bg-slate-800 disabled:opacity-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-400"
           type="submit"
           disabled={loading}
         >
-          {loading ? "Signing in..." : "Sign in"}
+          {loading ? "Вход..." : "Войти"}
         </button>
       </form>
+      <p className="mt-4 text-sm text-slate-600">
+        Нет аккаунта?{" "}
+        <Link className="underline" to="/register">
+          Зарегистрироваться
+        </Link>
+      </p>
     </div>
   );
 }

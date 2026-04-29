@@ -6,9 +6,12 @@ import { DashboardPage } from "../pages/DashboardPage";
 import { LoggersPage } from "../pages/LoggersPage";
 import { LoggerSetupPage } from "../pages/LoggerSetupPage";
 import { LoginPage } from "../pages/LoginPage";
+import { RegisterPage } from "../pages/RegisterPage";
+import { AdminRoleRequestsPage } from "../pages/AdminRoleRequestsPage";
 
 export const router = createBrowserRouter([
   { path: "/login", element: <LoginPage /> },
+  { path: "/register", element: <RegisterPage /> },
   {
     path: "/",
     element: (
@@ -32,6 +35,14 @@ export const router = createBrowserRouter([
         element: (
           <RequireRole role="admin">
             <LoggerSetupPage />
+          </RequireRole>
+        ),
+      },
+      {
+        path: "admin-role-requests",
+        element: (
+          <RequireRole role="admin">
+            <AdminRoleRequestsPage />
           </RequireRole>
         ),
       },

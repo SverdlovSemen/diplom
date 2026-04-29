@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.api.deps.auth import require_admin, require_viewer
 from app.db.session import get_db_session
 from app.schemas.logger import (
     BulkUpdateResult,
@@ -33,7 +34,7 @@ from app.processing.pipeline import check_nginx_stat_active, get_ingest_state, g
 router = APIRouter()
 
 
-@router.get("/", response_model=list[LoggerWithStatus])
+@router.get("/", response_model=list[LoggerWithStatus], dependencies=[Depends(require_viewer)])
 async def api_list_loggers(
     offset: int = Query(default=0, ge=0),
     limit: int = Query(default=100, ge=1, le=500),
@@ -71,7 +72,7 @@ async def api_list_loggers(
     return out
 
 
-@router.post("/", response_model=LoggerWithStatus, status_code=status.HTTP_201_CREATED)
+@router.post("/", response_model=LoggerWithStatus, status_code=status.HTTP_201_CREATED, dependencies=[Depends(require_admin)])
 async def api_create_logger(
     payload: LoggerCreate,
     session: AsyncSession = Depends(get_db_session),
@@ -92,7 +93,7 @@ async def api_create_logger(
     return LoggerWithStatus(**base.model_dump(), status=status_obj)
 
 
-@router.patch("/bulk-monitoring", response_model=BulkUpdateResult)
+@router.patch("/bulk-monitoring", response_model=BulkUpdateResult, dependencies=[Depends(require_admin)])
 async def api_bulk_update_monitoring(
     payload: LoggerBulkMonitoringUpdate,
     session: AsyncSession = Depends(get_db_session),
@@ -105,7 +106,7 @@ async def api_bulk_update_monitoring(
     return BulkUpdateResult(updated=updated)
 
 
-@router.get("/{logger_id}", response_model=LoggerWithStatus)
+@router.get("/{logger_id}", response_model=LoggerWithStatus, dependencies=[Depends(require_viewer)])
 async def api_get_logger(
     logger_id: uuid.UUID,
     session: AsyncSession = Depends(get_db_session),
@@ -137,7 +138,7 @@ async def api_get_logger(
     return LoggerWithStatus(**base.model_dump(), status=status_obj)
 
 
-@router.patch("/{logger_id}", response_model=LoggerWithStatus)
+@router.patch("/{logger_id}", response_model=LoggerWithStatus, dependencies=[Depends(require_admin)])
 async def api_update_logger(
     logger_id: uuid.UUID,
     payload: LoggerUpdate,
@@ -172,7 +173,7 @@ async def api_update_logger(
     return LoggerWithStatus(**base.model_dump(), status=status_obj)
 
 
-@router.delete("/{logger_id}", status_code=status.HTTP_204_NO_CONTENT)
+@router.delete("/{logger_id}", status_code=status.HTTP_204_NO_CONTENT, dependencies=[Depends(require_admin)])
 async def api_delete_logger(
     logger_id: uuid.UUID,
     session: AsyncSession = Depends(get_db_session),

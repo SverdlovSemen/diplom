@@ -13,14 +13,16 @@ import {
   type LoggerUpdate,
 } from "../api/loggers";
 import { captureNow } from "../api/measurements";
+import { ru } from "../i18n/ru";
+import { EmptyState, FeedbackBanner, SkeletonRows } from "../ui/feedback";
 
 function defaultNewLogger(): LoggerCreate {
   return {
-    name: "Logger 1",
+    name: "Логер 1",
     location: null,
     stream_key: "logger-1",
     gauge_type: "analog",
-    unit: "unit",
+    unit: "ед.",
     min_value: null,
     max_value: null,
     sample_interval_sec: 5,
@@ -56,6 +58,26 @@ function parseOptionalInt(raw: string): number | null {
   const n = Number(t);
   if (!Number.isFinite(n)) return null;
   return Math.round(n);
+}
+
+function humanizeIngestError(error: string | null | undefined): string | null {
+  if (!error) return null;
+  const lower = error.toLowerCase();
+  if (lower.includes("no_active_publisher")) return "Нет активной трансляции";
+  if (lower.includes("rtmp capture failed") || lower.includes("input/output error")) {
+    return "Не удалось получить кадр из RTMP-потока";
+  }
+  if (lower.includes("opencv capture timed out") || lower.includes("ffmpeg capture timed out")) {
+    return "Превышено время ожидания кадра";
+  }
+  if (lower.includes("configuration_incomplete")) return "Конфигурация логера не завершена";
+  return "Ошибка получения данных потока";
+}
+
+function humanizeMeasurementError(error: string | null | undefined): string {
+  if (!error) return ru.common.unknown;
+  if (error.toLowerCase().includes("нереалистичный скачок")) return "измерение не принято";
+  return error;
 }
 
 type LoggerRowProps = {
@@ -111,7 +133,7 @@ function LoggerRow({ logger, rtmpBaseUrl, onCapture, onRefresh, setPageError }: 
       setEditing(false);
       await onRefresh();
     } catch (e) {
-      setPageError(e instanceof Error ? e.message : "Failed to update logger");
+      setPageError(e instanceof Error ? e.message : ru.loggers.updateFailed);
     } finally {
       setSaving(false);
     }
@@ -126,74 +148,106 @@ function LoggerRow({ logger, rtmpBaseUrl, onCapture, onRefresh, setPageError }: 
       await deleteLogger(logger.id);
       await onRefresh();
     } catch (e) {
-      setPageError(e instanceof Error ? e.message : "Failed to delete logger");
+      setPageError(e instanceof Error ? e.message : ru.loggers.deleteFailed);
     } finally {
       setDeleting(false);
     }
   }
 
   const fullIngestUrl = rtmpBaseUrl ? `${rtmpBaseUrl}/${logger.stream_key}` : null;
+  const gaugeTypeLabel = logger.gauge_type === "analog" ? "аналоговый" : "цифровой";
 
   return (
     <div className="px-4 py-3 space-y-2">
       {!editing ? (
         <>
           <div className="font-medium">{logger.name}</div>
-          <div className="text-sm text-slate-600">
-            stream: <span className="font-mono">{logger.stream_key}</span> · {logger.gauge_type} · interval{" "}
-            {logger.sample_interval_sec}s · {logger.enabled ? "enabled" : "disabled"}
+          <div className="flex flex-wrap items-center gap-2 text-sm text-slate-600">
+            <span>
+              поток: <span className="font-mono">{logger.stream_key}</span>
+            </span>
+            <span className="rounded-full bg-slate-100 px-2 py-0.5 text-xs text-slate-700">{gaugeTypeLabel}</span>
+            <span>интервал {logger.sample_interval_sec}с</span>
+            <span
+              className={`rounded-full px-2 py-0.5 text-xs ${
+                logger.enabled ? "bg-emerald-100 text-emerald-800" : "bg-slate-100 text-slate-600"
+              }`}
+            >
+              {logger.enabled ? "включен" : "выключен"}
+            </span>
           </div>
           <div className="text-xs text-slate-600">
-            mode: {logger.capture_mode}
+            режим: {logger.capture_mode === "continuous" ? "непрерывный" : "по расписанию"}
             {logger.capture_mode === "schedule"
               ? ` (${logger.schedule_start_hour_utc ?? "?"}:00-${logger.schedule_end_hour_utc ?? "?"}:00 UTC)`
               : ""}
-            {logger.image_retention_days ? ` · retention: ${logger.image_retention_days}d` : " · retention: off"}
+            {logger.image_retention_days ? ` · хранение изображений: ${logger.image_retention_days} дн.` : " · хранение изображений: выкл."}
           </div>
           {fullIngestUrl ? (
             <div className="text-xs text-slate-600">
-              ingest URL: <span className="font-mono">{fullIngestUrl}</span>
+              URL ingest: <span className="font-mono">{fullIngestUrl}</span>
             </div>
           ) : null}
           <div className="text-sm text-slate-600">
-            ingest:{" "}
-            <span className={logger.status.stream_active ? "text-green-700" : "text-slate-500"}>
-              {logger.status.stream_active ? "active" : "inactive"}
+            поток:{" "}
+            <span
+              className={`rounded-full px-2 py-0.5 text-xs ${
+                logger.status.stream_active ? "bg-emerald-100 text-emerald-800" : "bg-slate-100 text-slate-600"
+              }`}
+            >
+              {logger.status.stream_active ? "активен" : "неактивен"}
             </span>
             {logger.status.stream_unavailable_persisted ? (
               <span className="ml-2 text-amber-800 font-medium" title="По данным БД после последнего успешного кадра">
-                недоступен (БД)
+                поток недоступен
               </span>
             ) : null}
-            {logger.last_ingest_error ? (
-              <span className="ml-2 text-red-700" title={`gap: ${logger.last_stream_gap_at ?? "—"}`}>
-                БД: {logger.last_ingest_error}
+            {logger.status.ingest_last_error || logger.last_ingest_error ? (
+              <span
+                className="ml-2 text-red-700"
+                title={
+                  [logger.status.ingest_last_error, logger.last_ingest_error].filter(Boolean).join(" | ") ||
+                  undefined
+                }
+              >
+                причина: {humanizeIngestError(logger.status.ingest_last_error ?? logger.last_ingest_error)}
               </span>
-            ) : null}
-            {logger.status.ingest_last_error ? (
-              <span className="ml-2 text-red-700">ingest error: {logger.status.ingest_last_error}</span>
             ) : null}
             {logger.status.last_measurement_at ? (
               <span className="ml-2">
-                last: {new Date(logger.status.last_measurement_at).toLocaleString()} ·{" "}
-                {logger.status.last_ok === null ? "n/a" : logger.status.last_ok ? "OK" : `Error: ${logger.status.last_error ?? "unknown"}`}
+                последний: {new Date(logger.status.last_measurement_at).toLocaleString()} ·{" "}
+                {logger.status.last_ok === null
+                  ? ru.common.notAvailableShort
+                  : logger.status.last_ok
+                    ? ru.common.ok
+                    : `${ru.common.errorPrefix} ${humanizeMeasurementError(logger.status.last_error)}`}
               </span>
             ) : (
-              <span className="ml-2">last: n/a</span>
+              <span className="ml-2">последний: {ru.common.notAvailableShort}</span>
             )}
           </div>
           <div className="flex items-center gap-4">
             <Link className="text-sm font-medium text-slate-900 underline underline-offset-4" to={`/loggers/${logger.id}/setup`}>
-              Setup
+              {ru.loggers.setup}
             </Link>
-            <button className="text-sm underline" onClick={() => void onCapture(logger.id)}>
-              Capture now
+            <button
+              className="text-sm underline rounded-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-300"
+              onClick={() => void onCapture(logger.id)}
+            >
+              {ru.loggers.captureNow}
             </button>
-            <button className="text-sm underline" onClick={() => setEditing(true)}>
-              Edit
+            <button
+              className="text-sm underline rounded-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-300"
+              onClick={() => setEditing(true)}
+            >
+              {ru.loggers.edit}
             </button>
-            <button className="text-sm text-red-700 underline disabled:opacity-50" onClick={() => void onDelete()} disabled={deleting}>
-              {deleting ? "Deleting..." : "Delete"}
+            <button
+              className="text-sm text-red-700 underline disabled:opacity-50 rounded-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-red-300"
+              onClick={() => void onDelete()}
+              disabled={deleting}
+            >
+              {deleting ? ru.loggers.deleting : ru.loggers.delete}
             </button>
           </div>
         </>
@@ -204,27 +258,27 @@ function LoggerRow({ logger, rtmpBaseUrl, onCapture, onRefresh, setPageError }: 
               className="rounded border px-2 py-1"
               value={draft.name ?? ""}
               onChange={(e) => setDraft((s) => ({ ...s, name: e.target.value }))}
-              placeholder="Name"
+              placeholder="Название"
             />
             <input
               className="rounded border px-2 py-1"
               value={draft.location ?? ""}
               onChange={(e) => setDraft((s) => ({ ...s, location: e.target.value || null }))}
-              placeholder="Location"
+              placeholder="Локация"
             />
             <select
               className="rounded border px-2 py-1"
               value={draft.gauge_type ?? logger.gauge_type}
               onChange={(e) => setDraft((s) => ({ ...s, gauge_type: e.target.value as Logger["gauge_type"] }))}
             >
-              <option value="analog">analog</option>
-              <option value="digital">digital</option>
+              <option value="analog">аналоговый</option>
+              <option value="digital">цифровой</option>
             </select>
             <input
               className="rounded border px-2 py-1"
               value={draft.unit ?? ""}
               onChange={(e) => setDraft((s) => ({ ...s, unit: e.target.value }))}
-              placeholder="Unit"
+              placeholder="Единица измерения"
             />
             <input
               className="rounded border px-2 py-1"
@@ -238,7 +292,7 @@ function LoggerRow({ logger, rtmpBaseUrl, onCapture, onRefresh, setPageError }: 
                   sample_interval_sec: parseInterval(e.target.value, logger.sample_interval_sec),
                 }))
               }
-              placeholder="sample interval sec"
+              placeholder="Интервал опроса, сек"
             />
             <label className="flex items-center gap-2 rounded border px-2 py-1 text-sm">
               <input
@@ -246,7 +300,7 @@ function LoggerRow({ logger, rtmpBaseUrl, onCapture, onRefresh, setPageError }: 
                 checked={draft.enabled ?? logger.enabled}
                 onChange={(e) => setDraft((s) => ({ ...s, enabled: e.target.checked }))}
               />
-              enabled
+              включен
             </label>
             <select
               className="rounded border px-2 py-1"
@@ -261,8 +315,8 @@ function LoggerRow({ logger, rtmpBaseUrl, onCapture, onRefresh, setPageError }: 
                 }));
               }}
             >
-              <option value="continuous">continuous</option>
-              <option value="schedule">schedule</option>
+              <option value="continuous">непрерывный</option>
+              <option value="schedule">по расписанию</option>
             </select>
             <input
               className="rounded border px-2 py-1"
@@ -271,7 +325,7 @@ function LoggerRow({ logger, rtmpBaseUrl, onCapture, onRefresh, setPageError }: 
               max={23}
               value={draft.schedule_start_hour_utc ?? ""}
               onChange={(e) => setDraft((s) => ({ ...s, schedule_start_hour_utc: parseOptionalInt(e.target.value) }))}
-              placeholder="start hour UTC (0-23)"
+              placeholder="час начала UTC (0-23)"
               disabled={(draft.capture_mode ?? logger.capture_mode) !== "schedule"}
             />
             <input
@@ -281,7 +335,7 @@ function LoggerRow({ logger, rtmpBaseUrl, onCapture, onRefresh, setPageError }: 
               max={23}
               value={draft.schedule_end_hour_utc ?? ""}
               onChange={(e) => setDraft((s) => ({ ...s, schedule_end_hour_utc: parseOptionalInt(e.target.value) }))}
-              placeholder="end hour UTC (0-23)"
+              placeholder="час окончания UTC (0-23)"
               disabled={(draft.capture_mode ?? logger.capture_mode) !== "schedule"}
             />
             <input
@@ -291,7 +345,7 @@ function LoggerRow({ logger, rtmpBaseUrl, onCapture, onRefresh, setPageError }: 
               max={3650}
               value={draft.image_retention_days ?? ""}
               onChange={(e) => setDraft((s) => ({ ...s, image_retention_days: parseOptionalInt(e.target.value) }))}
-              placeholder="image retention days (optional)"
+              placeholder="хранение изображений, дней (опц.)"
             />
             <input
               className="rounded border px-2 py-1"
@@ -307,22 +361,23 @@ function LoggerRow({ logger, rtmpBaseUrl, onCapture, onRefresh, setPageError }: 
             />
           </div>
           <p className="text-xs text-slate-600">
-            stream_key редактируется только при создании; параметры распознавания меняются на странице Setup.
+            Поле stream_key редактируется только при создании; параметры распознавания меняются на странице
+            «Настройка».
           </p>
           <div className="flex items-center gap-3">
             <button
-              className="rounded-md bg-slate-900 px-3 py-1.5 text-sm text-white hover:bg-slate-800 disabled:opacity-50"
+              className="rounded-md bg-slate-900 px-3 py-1.5 text-sm text-white hover:bg-slate-800 disabled:opacity-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-400"
               onClick={() => void onSave()}
               disabled={saving}
             >
-              {saving ? "Saving..." : "Save"}
+              {saving ? ru.loggers.saving : ru.loggers.save}
             </button>
             <button
-              className="rounded-md border px-3 py-1.5 text-sm hover:bg-slate-50"
+              className="rounded-md border px-3 py-1.5 text-sm hover:bg-slate-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-300"
               onClick={() => setEditing(false)}
               disabled={saving}
             >
-              Cancel
+              {ru.loggers.cancel}
             </button>
           </div>
         </>
@@ -358,7 +413,7 @@ export function LoggersPage(): React.ReactElement {
       setItems(data);
     } catch (e) {
       setItems([]);
-      setError(e instanceof Error ? e.message : "Failed to load loggers");
+      setError(e instanceof Error ? e.message : ru.loggers.loadFailed);
     }
   }, []);
 
@@ -393,7 +448,7 @@ export function LoggersPage(): React.ReactElement {
       setForm(defaultNewLogger());
       await refresh();
     } catch (e) {
-      setError(e instanceof Error ? e.message : "Failed to create logger");
+      setError(e instanceof Error ? e.message : ru.loggers.createFailed);
     } finally {
       setCreating(false);
     }
@@ -405,7 +460,7 @@ export function LoggersPage(): React.ReactElement {
       await captureNow(loggerId);
       await refresh();
     } catch (e) {
-      setError(e instanceof Error ? e.message : "Capture failed");
+      setError(e instanceof Error ? e.message : ru.loggers.captureFailed);
     }
   }
 
@@ -435,7 +490,7 @@ export function LoggersPage(): React.ReactElement {
       setBulkConfirm(false);
       await refresh();
     } catch (e) {
-      setError(e instanceof Error ? e.message : "Bulk update failed");
+      setError(e instanceof Error ? e.message : ru.loggers.bulkFailed);
     } finally {
       setBulkApplying(false);
     }
@@ -444,19 +499,22 @@ export function LoggersPage(): React.ReactElement {
   return (
     <div className="space-y-4">
       <div className="flex items-center justify-between">
-        <h1 className="text-2xl font-semibold">Loggers</h1>
+        <h1 className="text-2xl font-semibold">{ru.loggers.title}</h1>
         <label className="flex items-center gap-2 text-sm text-slate-700">
           <input type="checkbox" checked={autoRefresh} onChange={(e) => setAutoRefresh(e.target.checked)} />
-          Auto refresh
+          {ru.loggers.autoRefresh}
         </label>
       </div>
 
       <div className="rounded-lg border bg-white p-4 space-y-3">
-        <div className="font-medium">Global monitoring settings (all loggers)</div>
+        <div className="font-medium">Глобальные настройки мониторинга (все логеры)</div>
+        <p className="text-xs text-slate-600">
+          Используйте этот блок только для массовых изменений. Настройки будут применены ко всем выбранным логерам.
+        </p>
         <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
           <input
             className="rounded border px-2 py-1"
-            placeholder="sample interval sec"
+            placeholder="Интервал опроса, сек"
             value={bulkForm.sample_interval_sec}
             onChange={(e) => setBulkForm((s) => ({ ...s, sample_interval_sec: e.target.value }))}
           />
@@ -465,18 +523,18 @@ export function LoggersPage(): React.ReactElement {
             value={bulkForm.enabled}
             onChange={(e) => setBulkForm((s) => ({ ...s, enabled: e.target.value as "unchanged" | "true" | "false" }))}
           >
-            <option value="unchanged">enabled: unchanged</option>
-            <option value="true">enabled: true</option>
-            <option value="false">enabled: false</option>
+            <option value="unchanged">включен: без изменений</option>
+            <option value="true">включен: да</option>
+            <option value="false">включен: нет</option>
           </select>
           <select
             className="rounded border px-2 py-1"
             value={bulkForm.capture_mode}
             onChange={(e) => setBulkForm((s) => ({ ...s, capture_mode: e.target.value as "unchanged" | Logger["capture_mode"] }))}
           >
-            <option value="unchanged">capture_mode: unchanged</option>
-            <option value="continuous">capture_mode: continuous</option>
-            <option value="schedule">capture_mode: schedule</option>
+            <option value="unchanged">режим: без изменений</option>
+            <option value="continuous">режим: непрерывный</option>
+            <option value="schedule">режим: по расписанию</option>
           </select>
           <label className="flex items-center gap-2 rounded border px-2 py-1 text-sm">
             <input
@@ -484,23 +542,23 @@ export function LoggersPage(): React.ReactElement {
               checked={bulkForm.apply_to_disabled}
               onChange={(e) => setBulkForm((s) => ({ ...s, apply_to_disabled: e.target.checked }))}
             />
-            include disabled loggers
+            включать выключенные логеры
           </label>
           <input
             className="rounded border px-2 py-1"
-            placeholder="schedule start hour UTC"
+            placeholder="час начала по UTC"
             value={bulkForm.schedule_start_hour_utc}
             onChange={(e) => setBulkForm((s) => ({ ...s, schedule_start_hour_utc: e.target.value }))}
           />
           <input
             className="rounded border px-2 py-1"
-            placeholder="schedule end hour UTC"
+            placeholder="час окончания по UTC"
             value={bulkForm.schedule_end_hour_utc}
             onChange={(e) => setBulkForm((s) => ({ ...s, schedule_end_hour_utc: e.target.value }))}
           />
           <input
             className="rounded border px-2 py-1"
-            placeholder="image retention days"
+            placeholder="хранение изображений, дней"
             value={bulkForm.image_retention_days}
             onChange={(e) => setBulkForm((s) => ({ ...s, image_retention_days: e.target.value }))}
           />
@@ -511,34 +569,33 @@ export function LoggersPage(): React.ReactElement {
         </label>
         <div className="flex items-center gap-3">
           <button
-            className="rounded-md bg-slate-900 px-3 py-2 text-sm font-medium text-white hover:bg-slate-800 disabled:opacity-50"
+            className="rounded-md bg-slate-900 px-3 py-2 text-sm font-medium text-white hover:bg-slate-800 disabled:opacity-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-400"
             onClick={() => void onBulkApply()}
             disabled={bulkApplying}
           >
-            {bulkApplying ? "Applying..." : "Apply globally"}
+            {bulkApplying ? ru.loggers.applyInProgress : ru.loggers.applyGlobally}
           </button>
-          {bulkResult ? <span className="text-sm text-slate-700">{bulkResult}</span> : null}
         </div>
       </div>
 
       <div className="rounded-lg border bg-white p-4 space-y-3">
-        <div className="font-medium">Create logger</div>
+        <div className="font-medium">{ru.loggers.createLogger}</div>
         <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
           <input
             className="rounded border px-2 py-1"
-            placeholder="Name"
+            placeholder="Название"
             value={form.name}
             onChange={(e) => setForm((s) => ({ ...s, name: e.target.value }))}
           />
           <input
             className="rounded border px-2 py-1"
-            placeholder="Location"
+            placeholder="Локация"
             value={form.location ?? ""}
             onChange={(e) => setForm((s) => ({ ...s, location: e.target.value || null }))}
           />
           <input
             className="rounded border px-2 py-1"
-            placeholder="RTMP stream key"
+            placeholder="Ключ RTMP-потока"
             value={form.stream_key}
             onChange={(e) => setForm((s) => ({ ...s, stream_key: e.target.value }))}
           />
@@ -547,8 +604,8 @@ export function LoggersPage(): React.ReactElement {
             value={form.gauge_type}
             onChange={(e) => setForm((s) => ({ ...s, gauge_type: e.target.value as Logger["gauge_type"] }))}
           >
-            <option value="analog">analog</option>
-            <option value="digital">digital</option>
+            <option value="analog">аналоговый</option>
+            <option value="digital">цифровой</option>
           </select>
           <input
             className="rounded border px-2 py-1"
@@ -574,15 +631,15 @@ export function LoggersPage(): React.ReactElement {
               }))
             }
           >
-            <option value="continuous">continuous</option>
-            <option value="schedule">schedule</option>
+            <option value="continuous">непрерывный</option>
+            <option value="schedule">по расписанию</option>
           </select>
           <input
             className="rounded border px-2 py-1"
             type="number"
             min={0}
             max={23}
-            placeholder="Schedule start UTC (0-23)"
+            placeholder="Начало по UTC (0-23)"
             value={form.schedule_start_hour_utc ?? ""}
             disabled={form.capture_mode !== "schedule"}
             onChange={(e) => setForm((s) => ({ ...s, schedule_start_hour_utc: parseOptionalInt(e.target.value) }))}
@@ -592,7 +649,7 @@ export function LoggersPage(): React.ReactElement {
             type="number"
             min={0}
             max={23}
-            placeholder="Schedule end UTC (0-23)"
+            placeholder="Окончание по UTC (0-23)"
             value={form.schedule_end_hour_utc ?? ""}
             disabled={form.capture_mode !== "schedule"}
             onChange={(e) => setForm((s) => ({ ...s, schedule_end_hour_utc: parseOptionalInt(e.target.value) }))}
@@ -602,33 +659,36 @@ export function LoggersPage(): React.ReactElement {
             type="number"
             min={1}
             max={3650}
-            placeholder="Image retention days (optional)"
+            placeholder="Хранение изображений, дней (опц.)"
             value={form.image_retention_days ?? ""}
             onChange={(e) => setForm((s) => ({ ...s, image_retention_days: parseOptionalInt(e.target.value) }))}
           />
         </div>
         <p className="text-xs text-slate-600">
-          Поля min/max — это <strong>допустимый диапазон показаний</strong> для контроля (ТЗ); не путать с min/max на шкале в калибровке аналога на странице Setup.
+          Поля min/max — это <strong>допустимый диапазон показаний</strong> для контроля (ТЗ); не путать с min/max на
+          шкале в калибровке аналога на странице «Настройка».
         </p>
         {rtmpBaseUrl ? (
           <p className="text-xs text-slate-600">
-            RTMP ingest URL для нового логера: <span className="font-mono">{`${rtmpBaseUrl}/${form.stream_key}`}</span>
+            RTMP URL для ingest нового логера: <span className="font-mono">{`${rtmpBaseUrl}/${form.stream_key}`}</span>
           </p>
         ) : null}
         <button
-          className="rounded-md bg-slate-900 px-3 py-2 text-sm font-medium text-white hover:bg-slate-800 disabled:opacity-50"
+          className="rounded-md bg-slate-900 px-3 py-2 text-sm font-medium text-white hover:bg-slate-800 disabled:opacity-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-400"
           onClick={() => void onCreate()}
           disabled={creating}
         >
-          Create logger
+          {ru.loggers.createLogger}
         </button>
       </div>
 
-      {error ? <div className="rounded-md border border-red-200 bg-red-50 p-3 text-red-800">{error}</div> : null}
+      {error ? <FeedbackBanner tone="error" message={error} /> : null}
+      {bulkResult ? <FeedbackBanner tone="success" message={bulkResult} /> : null}
 
       <div className="rounded-lg border bg-white">
-        <div className="border-b px-4 py-3 text-sm font-medium text-slate-700">Configured loggers</div>
+        <div className="border-b px-4 py-3 text-sm font-medium text-slate-700">Настроенные логеры</div>
         <div className="divide-y">
+          {items === null ? <SkeletonRows count={4} /> : null}
           {(items ?? []).map((l) => (
             <LoggerRow
               key={l.id}
@@ -639,8 +699,7 @@ export function LoggersPage(): React.ReactElement {
               setPageError={setError}
             />
           ))}
-          {items?.length === 0 ? <div className="px-4 py-3 text-slate-600">No loggers yet.</div> : null}
-          {items === null ? <div className="px-4 py-3 text-slate-600">Loading…</div> : null}
+          {items?.length === 0 ? <EmptyState message={ru.loggers.noLoggers} /> : null}
         </div>
       </div>
     </div>

@@ -54,7 +54,7 @@ export function MeasurementDynamicsChart({ points, unit, height = 320 }: Props):
     const series = chart.addSeries(LineSeries, {
       color: "#0f172a",
       lineWidth: 2,
-      title: unit ? `value, ${unit}` : "value",
+      title: "значение, единица измерения",
     });
     chartRef.current = chart;
     seriesRef.current = series;

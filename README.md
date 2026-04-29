@@ -76,6 +76,19 @@ docker compose down
 | Администратор | `APP_SEED_ADMIN_EMAIL`, `APP_SEED_ADMIN_PASSWORD` | `admin@example.com` / `admin123` |
 | Наблюдатель (если включён) | `APP_SEED_VIEWER_EMAIL`, `APP_SEED_VIEWER_PASSWORD` | `viewer@example.com` / `viewer123` |
 
+### Регистрация и повышение роли
+
+- Саморегистрация доступна через `POST /api/v1/auth/register` (страница `/register` в UI).
+- Новый пользователь всегда создаётся с ролью `viewer` (наблюдатель).
+- Пользователь с ролью `viewer` может подать заявку на повышение роли:
+  - `POST /api/v1/admin-role-requests`
+  - `GET /api/v1/admin-role-requests/me` (просмотр своей последней заявки)
+- Модерация заявок доступна только действующему администратору:
+  - `GET /api/v1/admin-role-requests`
+  - `POST /api/v1/admin-role-requests/{id}/approve`
+  - `POST /api/v1/admin-role-requests/{id}/reject`
+- После `approve` роль пользователя меняется на `admin`.
+
 Также в файле указаны учётные данные **PostgreSQL** (`POSTGRES_USER`, `POSTGRES_PASSWORD` и др.) — они нужны для работы базы внутри Docker; для обычной проверки UI достаточно логина администратора выше.
 
 **Важно:** для реального развёртывания смените пароли и секреты (`APP_JWT_SECRET` и т.п.).
@@ -251,21 +264,23 @@ cd backend
 alembic upgrade head
 ```
 
-## Тесты backend CV
+## Тесты backend
 
-Для запуска тестов:
+Для запуска unit-тестов, которые не требуют БД:
 
 ```bash
 cd backend
 pip install -r requirements-dev.txt
-pytest -q
+pytest -q tests/test_recognizer_analog_zero_tail.py
 ```
 
-Запуск в Docker без изменения production-контейнера:
+Рекомендуемый запуск полного backend-набора в Docker:
 
 ```bash
 docker compose -f docker-compose.yml -f docker-compose.tests.yml run --rm backend-tests
 ```
+
+`docker-compose.tests.yml` поднимает отдельный PostgreSQL `postgres-tests` с базой `gauges_test`. Тесты не должны подключаться к основной базе `gauges`: destructive-сценарии дополнительно проверяют `APP_ENV=test`, host `postgres-tests` и database `gauges_test` перед очисткой таблиц.
 
 Если установлен `make`:
 

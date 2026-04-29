@@ -3,15 +3,32 @@ import { MeasurementDynamicsChart } from "../components/MeasurementDynamicsChart
 import { listLoggers, type Logger } from "../api/loggers";
 import { buildMediaUrl } from "../api/media";
 import {
-  downloadMeasurementsCsv,
+  adminRoleRequestStatusLabel,
+  createAdminRoleRequest,
+  getMyAdminRoleRequest,
+  type AdminRoleRequest,
+} from "../api/adminRoleRequests";
+import { ru } from "../i18n/ru";
+import { useAuth } from "../auth/AuthContext";
+import { EmptyState, FeedbackBanner, SkeletonRows } from "../ui/feedback";
+import {
+  downloadMeasurementsExport,
   fetchMeasurementsForChart,
   getMeasurementStats,
   listMeasurementAlerts,
+  type MeasurementExportFormat,
   type MeasurementAlert,
   listMeasurements,
   type Measurement,
   type MeasurementStats,
 } from "../api/measurements";
+
+function humanizeMeasurementError(error: string | null): string {
+  if (!error) return ru.common.unknown;
+  if (/^OCR failed:/i.test(error)) return "OCR: не удалось распознать число";
+  if (error.toLowerCase().includes("нереалистичный скачок")) return "измерение не принято";
+  return error;
+}
 
 function toDatetimeLocalValue(d: Date): string {
   const pad = (n: number) => String(n).padStart(2, "0");
@@ -19,6 +36,7 @@ function toDatetimeLocalValue(d: Date): string {
 }
 
 export function DashboardPage(): React.ReactElement {
+  const { user, refreshMe } = useAuth();
   const [loggers, setLoggers] = React.useState<Logger[]>([]);
   const [loggerFilter, setLoggerFilter] = React.useState<string>("");
   const [fromLocal, setFromLocal] = React.useState<string>(() => {
@@ -33,12 +51,17 @@ export function DashboardPage(): React.ReactElement {
   const [total, setTotal] = React.useState(0);
   const [stats, setStats] = React.useState<MeasurementStats | null>(null);
   const [loading, setLoading] = React.useState(false);
-  const [exporting, setExporting] = React.useState(false);
+  const [exporting, setExporting] = React.useState<MeasurementExportFormat | null>(null);
+  const [exportFormat, setExportFormat] = React.useState<MeasurementExportFormat>("xlsx");
   const [error, setError] = React.useState<string | null>(null);
   const [chartPoints, setChartPoints] = React.useState<Measurement[]>([]);
   const [chartLoading, setChartLoading] = React.useState(false);
   const [chartError, setChartError] = React.useState<string | null>(null);
   const [alerts, setAlerts] = React.useState<MeasurementAlert[]>([]);
+  const [roleRequest, setRoleRequest] = React.useState<AdminRoleRequest | null>(null);
+  const [roleRequestLoading, setRoleRequestLoading] = React.useState(false);
+  const [roleRequestError, setRoleRequestError] = React.useState<string | null>(null);
+  const defaultPageSize = 30;
 
   React.useEffect(() => {
     void (async () => {
@@ -51,6 +74,18 @@ export function DashboardPage(): React.ReactElement {
     })();
   }, []);
 
+  React.useEffect(() => {
+    if (!user || user.role !== "viewer") return;
+    void (async () => {
+      try {
+        const current = await getMyAdminRoleRequest();
+        setRoleRequest(current);
+      } catch {
+        // non-blocking section
+      }
+    })();
+  }, [user]);
+
   const applyDefaults = React.useCallback(() => {
     const to = new Date();
     const from = new Date(to.getTime() - 7 * 24 * 60 * 60 * 1000);
@@ -58,6 +93,12 @@ export function DashboardPage(): React.ReactElement {
     setToLocal(toDatetimeLocalValue(to));
     setPage(1);
   }, []);
+
+  const resetFilters = React.useCallback(() => {
+    setLoggerFilter("");
+    applyDefaults();
+    setPageSize(defaultPageSize);
+  }, [applyDefaults]);
 
   const load = React.useCallback(async () => {
     setLoading(true);
@@ -80,7 +121,7 @@ export function DashboardPage(): React.ReactElement {
       setStats(s);
       setAlerts(await listMeasurementAlerts({ ...filterArgs, limit: 20 }));
     } catch (e) {
-      setError(e instanceof Error ? e.message : "Failed to load measurements");
+      setError(e instanceof Error ? e.message : ru.dashboard.loadFailed);
       setStats(null);
       setAlerts([]);
     } finally {
@@ -137,33 +178,85 @@ export function DashboardPage(): React.ReactElement {
 
   const chartUnit =
     chartPoints[0]?.unit ?? loggers.find((l) => l.id === loggerFilter)?.unit ?? "";
+  const hasActiveFilters = loggerFilter !== "" || pageSize !== defaultPageSize;
 
-  const exportCsv = React.useCallback(async () => {
-    setExporting(true);
+  const exportReport = React.useCallback(async () => {
+    setExporting(exportFormat);
     setError(null);
     try {
       const fromIso = fromLocal ? new Date(fromLocal).toISOString() : undefined;
       const toIso = toLocal ? new Date(toLocal).toISOString() : undefined;
-      await downloadMeasurementsCsv({
-        loggerId: loggerFilter || undefined,
-        from: fromIso,
-        to: toIso,
-      });
+      await downloadMeasurementsExport(
+        exportFormat,
+        {
+          loggerId: loggerFilter || undefined,
+          from: fromIso,
+          to: toIso,
+        },
+      );
     } catch (e) {
-      setError(e instanceof Error ? e.message : "Export failed");
+      setError(e instanceof Error ? e.message : ru.dashboard.exportFailed);
     } finally {
-      setExporting(false);
+      setExporting(null);
     }
-  }, [fromLocal, toLocal, loggerFilter]);
+  }, [exportFormat, fromLocal, toLocal, loggerFilter]);
+
+  const requestAdminRole = React.useCallback(async () => {
+    setRoleRequestLoading(true);
+    setRoleRequestError(null);
+    try {
+      await createAdminRoleRequest();
+      const current = await getMyAdminRoleRequest();
+      setRoleRequest(current);
+    } catch (e) {
+      setRoleRequestError(e instanceof Error ? e.message : "Не удалось подать заявку");
+    } finally {
+      setRoleRequestLoading(false);
+    }
+  }, []);
+
+  React.useEffect(() => {
+    if (roleRequest?.status === "approved") {
+      void refreshMe();
+    }
+  }, [roleRequest, refreshMe]);
 
   return (
     <div className="space-y-4">
-      <h1 className="text-2xl font-semibold">Dashboard</h1>
+      <h1 className="text-2xl font-semibold">{ru.dashboard.title}</h1>
+      <FeedbackBanner
+        tone="info"
+        message={
+          user?.role === "viewer"
+            ? ru.dashboard.observerModeHint
+            : ru.dashboard.adminModeHint
+        }
+      />
+      {user?.role === "viewer" ? (
+        <div className="rounded-lg border bg-white p-4 space-y-2">
+          <div className="font-medium">Заявка на роль администратора</div>
+          <p className="text-sm text-slate-600">
+            Вы можете подать заявку на повышение роли. Подтверждение выполняет действующий администратор.
+          </p>
+          <div className="text-sm">
+            Статус:{" "}
+            <span className="font-medium">{adminRoleRequestStatusLabel(roleRequest?.status)}</span>
+          </div>
+          {roleRequestError ? <FeedbackBanner tone="error" message={roleRequestError} /> : null}
+          <button
+            type="button"
+            className="rounded-md bg-slate-900 px-3 py-1.5 text-sm text-white hover:bg-slate-800 disabled:opacity-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-400"
+            onClick={() => void requestAdminRole()}
+            disabled={roleRequestLoading || roleRequest?.status === "pending"}
+          >
+            {roleRequestLoading ? "Отправка..." : "Подать заявку на администратора"}
+          </button>
+        </div>
+      ) : null}
       <div className="rounded-lg border bg-white p-4 space-y-3">
         <div className="font-medium">История измерений</div>
         <p className="text-sm text-slate-600">
-          Фильтр по времени снимка (<code className="text-xs">captured_at</code>) и логеру. Пустые поля даты — без
-          ограничения с этой стороны.
+          Фильтр по времени снимка и логеру. Пустые поля даты — без ограничения с этой стороны.
         </p>
         <div className="flex flex-wrap gap-3 items-end">
           <label className="flex flex-col gap-1 text-sm">
@@ -227,21 +320,46 @@ export function DashboardPage(): React.ReactElement {
           </label>
           <button
             type="button"
-            className="rounded-md bg-slate-900 px-3 py-1.5 text-sm text-white hover:bg-slate-800"
+            className="rounded-md bg-slate-900 px-3 py-1.5 text-sm text-white hover:bg-slate-800 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-400"
             onClick={() => void load()}
           >
             Обновить
           </button>
           <button
             type="button"
-            disabled={exporting}
-            className="rounded-md border border-slate-300 bg-white px-3 py-1.5 text-sm hover:bg-slate-50 disabled:opacity-50"
-            onClick={() => void exportCsv()}
+            disabled={exporting !== null}
+            className="rounded-md border border-slate-300 bg-white px-3 py-1.5 text-sm hover:bg-slate-50 disabled:opacity-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-300"
+            onClick={() => void exportReport()}
           >
-            {exporting ? "Экспорт…" : "Скачать CSV"}
+            {exporting ? "Экспорт…" : "Скачать"}
           </button>
-          <button type="button" className="text-sm text-slate-600 underline" onClick={applyDefaults}>
+          <label className="flex flex-col gap-1 text-sm">
+            <span className="text-slate-600">Формат</span>
+            <select
+              className="rounded-md border border-slate-300 px-2 py-1.5"
+              value={exportFormat}
+              onChange={(e) => setExportFormat(e.target.value as MeasurementExportFormat)}
+              disabled={exporting !== null}
+            >
+              <option value="xlsx">Excel (.xlsx)</option>
+              <option value="pdf">PDF (сводка)</option>
+              <option value="csv">CSV (сырые данные)</option>
+            </select>
+          </label>
+          <button
+            type="button"
+            className="text-sm text-slate-600 underline rounded-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-300"
+            onClick={applyDefaults}
+          >
             Последние 7 дней
+          </button>
+          <button
+            type="button"
+            className="text-sm text-slate-600 underline rounded-sm disabled:opacity-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-300"
+            onClick={resetFilters}
+            disabled={!hasActiveFilters}
+          >
+            Сбросить фильтры
           </button>
         </div>
         <div className="flex flex-wrap items-center gap-2 text-sm text-slate-600">
@@ -255,7 +373,7 @@ export function DashboardPage(): React.ReactElement {
           <button
             type="button"
             disabled={page <= 1 || loading}
-            className="rounded-md border px-3 py-1 text-sm disabled:opacity-50"
+            className="rounded-md border px-3 py-1 text-sm disabled:opacity-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-300"
             onClick={() => setPage((p) => Math.max(1, p - 1))}
           >
             Назад
@@ -263,7 +381,7 @@ export function DashboardPage(): React.ReactElement {
           <button
             type="button"
             disabled={page >= totalPages || loading}
-            className="rounded-md border px-3 py-1 text-sm disabled:opacity-50"
+            className="rounded-md border px-3 py-1 text-sm disabled:opacity-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-300"
             onClick={() => setPage((p) => p + 1)}
           >
             Вперёд
@@ -274,7 +392,8 @@ export function DashboardPage(): React.ReactElement {
         <div className="rounded-lg border bg-white p-4 space-y-2">
           <div className="font-medium">Сводка за период</div>
           <p className="text-sm text-slate-600">
-            Те же фильтры, что у списка ниже. Min/max/avg — по записям с числовым значением.
+            Те же фильтры, что у списка ниже. Мин/макс/среднее — по очищенным значениям:
+            ok=true, без критичных CV-предупреждений; для analog дополнительно в пределах шкалы.
           </p>
           <dl className="grid grid-cols-2 gap-x-6 gap-y-2 text-sm sm:grid-cols-3">
             <div>
@@ -282,11 +401,11 @@ export function DashboardPage(): React.ReactElement {
               <dd className="font-mono">{stats.count}</dd>
             </div>
             <div>
-              <dt className="text-slate-600">С числом (value)</dt>
+              <dt className="text-slate-600">С числом</dt>
               <dd className="font-mono">{stats.value_count}</dd>
             </div>
             <div>
-              <dt className="text-slate-600">Min / max / avg</dt>
+              <dt className="text-slate-600">{ru.dashboard.summaryMinMaxAvg}</dt>
               <dd className="font-mono">
                 {stats.value_min !== null && stats.value_max !== null && stats.value_avg !== null
                   ? `${stats.value_min.toFixed(3)} / ${stats.value_max.toFixed(3)} / ${stats.value_avg.toFixed(3)}`
@@ -294,36 +413,33 @@ export function DashboardPage(): React.ReactElement {
               </dd>
             </div>
             <div>
-              <dt className="text-slate-600">Ошибки распознавания (ok=false)</dt>
+              <dt className="text-slate-600">Ошибки распознавания</dt>
               <dd className="font-mono">{stats.recognition_fail_count}</dd>
             </div>
             <div>
               <dt className="text-slate-600">Вне допустимого диапазона</dt>
               <dd className="font-mono">{stats.out_of_range_count}</dd>
             </div>
-            <div>
-              <dt className="text-slate-600">Предупреждения CV (непустой json)</dt>
-              <dd className="font-mono">{stats.cv_warnings_count}</dd>
-            </div>
           </dl>
         </div>
       ) : null}
       <div className="rounded-lg border bg-white p-4 space-y-2">
-        <div className="font-medium">Алерты аномалий (out_of_range)</div>
+        <div className="font-medium">Алерты аномалий</div>
         <p className="text-sm text-slate-600">Последние 20 записей с выходом за допустимый диапазон.</p>
         <div className="divide-y">
           {alerts.map((a) => (
             <div key={a.measurement_id} className="py-2 text-sm">
               <div>
                 <span className="font-medium text-amber-800">{a.logger_name}</span> ·{" "}
-                {a.value !== null ? `${a.value.toFixed(3)} ${a.unit}` : "n/a"} · {new Date(a.captured_at).toLocaleString()}
+                {a.value !== null ? `${a.value.toFixed(3)} ${a.unit}` : ru.common.notAvailableShort} ·{" "}
+                {new Date(a.captured_at).toLocaleString()}
               </div>
               <div className="text-slate-600">
-                logger <span className="font-mono">{a.logger_id.slice(0, 8)}</span>
-                {a.error ? <span className="ml-2 text-red-700">err: {a.error}</span> : null}
+                {ru.common.loggerShort} <span className="font-mono">{a.logger_id.slice(0, 8)}</span>
+                {a.error ? <span className="ml-2 text-red-700">{ru.dashboard.errorShortPrefix} {humanizeMeasurementError(a.error)}</span> : null}
                 {a.image_path ? (
                   <a className="ml-2 underline underline-offset-4" href={buildMediaUrl(a.image_path)} target="_blank" rel="noreferrer">
-                    image
+                    {ru.common.image}
                   </a>
                 ) : null}
               </div>
@@ -335,44 +451,47 @@ export function DashboardPage(): React.ReactElement {
       <div className="rounded-lg border bg-white p-4 space-y-2">
         <div className="font-medium">Динамика показаний</div>
         <p className="text-sm text-slate-600">
-          График <code className="text-xs">value</code> по <code className="text-xs">captured_at</code> (те же фильтры
-          периода). Данные подгружаются через API списка измерений (B1), до 10000 точек.
+          График значения по времени кадра. Данные подгружаются через API списка измерений, до 10000 точек.
         </p>
         {!loggerFilter ? (
-          <p className="text-sm text-slate-600">Выберите конкретный логер в фильтре выше.</p>
+          <EmptyState message="Выберите конкретный логер в фильтре выше." />
         ) : chartLoading ? (
-          <p className="text-sm text-slate-600">Загрузка графика…</p>
+          <p className="text-sm text-slate-600">{ru.common.loading}</p>
         ) : chartError ? (
-          <p className="text-sm text-red-700">{chartError}</p>
+          <FeedbackBanner tone="error" message={chartError} />
         ) : chartPoints.filter((m) => m.value != null && Number.isFinite(m.value)).length === 0 ? (
-          <p className="text-sm text-slate-600">Нет числовых измерений в выбранном периоде.</p>
+          <EmptyState message="Нет числовых измерений в выбранном периоде." />
         ) : (
           <MeasurementDynamicsChart points={chartPoints} unit={chartUnit} height={320} />
         )}
       </div>
-      {error ? <div className="rounded-md border border-red-200 bg-red-50 p-3 text-red-800">{error}</div> : null}
+      {error ? <FeedbackBanner tone="error" message={error} /> : null}
       <div className="rounded-lg border bg-white">
         <div className="border-b px-4 py-3 font-medium">Измерения</div>
         <div className="divide-y">
+          {loading && items.length === 0 ? <SkeletonRows count={4} /> : null}
           {items.map((m) => (
             <div key={m.id} className="px-4 py-3 text-sm">
               <div>
-                logger <span className="font-mono">{m.logger_id.slice(0, 8)}</span> ·{" "}
-                {m.value !== null ? `${m.value.toFixed(3)} ${m.unit}` : "n/a"} ·{" "}
+                {ru.common.loggerShort} <span className="font-mono">{m.logger_id.slice(0, 8)}</span> ·{" "}
+                {m.value !== null ? `${m.value.toFixed(3)} ${m.unit}` : ru.common.notAvailableShort} ·{" "}
                 {new Date(m.captured_at).toLocaleString()}
               </div>
-              <div className="text-slate-600">
-                {m.ok ? "OK" : `Error: ${m.error ?? "unknown"}`}
+              <div className="flex flex-wrap items-center gap-2 text-slate-600">
+                <span
+                  className={`rounded-full px-2 py-0.5 text-xs ${
+                    m.ok ? "bg-emerald-100 text-emerald-800" : "bg-red-100 text-red-800"
+                  }`}
+                >
+                  {m.ok ? ru.common.ok : `${ru.common.errorPrefix} ${humanizeMeasurementError(m.error)}`}
+                </span>
                 {m.out_of_range === true ? (
-                  <span className="ml-2 font-medium text-amber-800">Вне допустимого диапазона</span>
-                ) : m.out_of_range === false ? (
-                  <span className="ml-2 text-slate-500">В диапазоне</span>
-                ) : null}
-                {m.cv_warnings_json ? (
-                  <span className="ml-2 text-xs text-slate-500" title={m.cv_warnings_json}>
-                    CV: {m.cv_warnings_json}
+                  <span className="rounded-full bg-amber-100 px-2 py-0.5 text-xs font-medium text-amber-800">
+                    Вне допустимого диапазона
                   </span>
-                ) : null}{" "}
+                ) : m.out_of_range === false ? (
+                  <span className="rounded-full bg-slate-100 px-2 py-0.5 text-xs text-slate-600">В диапазоне</span>
+                ) : null}
                 {m.image_path ? (
                   <a
                     className="underline underline-offset-4"
@@ -380,13 +499,13 @@ export function DashboardPage(): React.ReactElement {
                     target="_blank"
                     rel="noreferrer"
                   >
-                    image
+                    {ru.common.image}
                   </a>
                 ) : null}
               </div>
             </div>
           ))}
-          {items.length === 0 && !loading ? <div className="px-4 py-3 text-slate-600">Нет записей по фильтру.</div> : null}
+          {items.length === 0 && !loading ? <EmptyState message="Нет записей по фильтру." /> : null}
         </div>
       </div>
     </div>

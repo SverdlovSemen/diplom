@@ -247,6 +247,7 @@ async def api_test_recognize(
                     "logger_id": str(logger_id),
                     "frame_source": frame_source,
                     "ocr_raw": cv_result.ocr_raw,
+                    "cv_debug": cv_result.debug,
                     "ok": cv_result.ok,
                 },
             )
@@ -270,6 +271,7 @@ async def api_test_recognize(
             "frame_source": frame_source,
             "analog_debug": analog_debug,
             "cv_warnings": cv_result.warnings,
+            "cv_debug": cv_result.debug,
         }
     except HTTPException:
         raise

@@ -21,6 +21,13 @@ ZERO_ZONE_ANTI_PENALTY = 18.0
 POSTCHECK_RADIAL_TO_MIN_DEG = 15.0
 POSTCHECK_SELECTED_TO_ANTI_DEG = 22.0
 MIN_COMPATIBLE_ANGLE_DEG = 26.0
+DIGITAL_MIN_STDDEV = 6.0
+DIGITAL_MIN_MEAN = 20.0
+DIGITAL_MAX_MEAN = 245.0
+DIGITAL_MIN_ACCEPT_SCORE = 2.0
+DIGITAL_MIN_NONBLACK_RATIO = 0.01
+DIGITAL_MAX_BINARY_FILL_RATIO = 0.97
+DIGITAL_MIN_SIGNIFICANT_COMPONENTS = 1
 
 
 def _parse_json(value: str | None) -> dict[str, Any]:
@@ -111,8 +118,73 @@ def _append_calibration_roi_warnings(out_warnings: list[str], calibration_data: 
             break
 
 
-def _recognize_digital(image: np.ndarray) -> CVResult:
+def _recognize_digital(image: np.ndarray, bounds: tuple[float, float] | None = None) -> CVResult:
+    def _count_significant_components(mask: np.ndarray) -> int:
+        num_labels, _labels, stats, _cent = cv2.connectedComponentsWithStats(mask, connectivity=8)
+        significant = 0
+        image_area = float(mask.shape[0] * mask.shape[1])
+        for i in range(1, int(num_labels)):
+            area = int(stats[i, cv2.CC_STAT_AREA])
+            w = int(stats[i, cv2.CC_STAT_WIDTH])
+            h = int(stats[i, cv2.CC_STAT_HEIGHT])
+            area_ratio = float(area) / image_area if image_area > 0 else 0.0
+            if area < 24 or area_ratio > 0.85:
+                continue
+            if h < 8 or w < 2:
+                continue
+            significant += 1
+        return significant
+
+    def _frame_plausibility(gray_img: np.ndarray) -> tuple[bool, dict[str, Any]]:
+        nonblack_ratio = float(np.count_nonzero(gray_img > 28)) / float(gray_img.size)
+        nonwhite_ratio = float(np.count_nonzero(gray_img < 245)) / float(gray_img.size)
+        _, bin_otsu = cv2.threshold(gray_img, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        fill_ratio = float(np.count_nonzero(bin_otsu > 0)) / float(bin_otsu.size)
+        white_on_black_components = _count_significant_components(bin_otsu)
+        black_on_white_components = _count_significant_components(cv2.bitwise_not(bin_otsu))
+        component_count = max(white_on_black_components, black_on_white_components)
+        metrics = {
+            "nonblack_ratio": round(nonblack_ratio, 5),
+            "nonwhite_ratio": round(nonwhite_ratio, 5),
+            "binary_fill_ratio": round(fill_ratio, 5),
+            "white_on_black_components": white_on_black_components,
+            "black_on_white_components": black_on_white_components,
+            "component_count": component_count,
+        }
+        plausible = (
+            nonblack_ratio >= DIGITAL_MIN_NONBLACK_RATIO
+            and nonwhite_ratio >= 0.01
+            and fill_ratio <= DIGITAL_MAX_BINARY_FILL_RATIO
+            and component_count >= DIGITAL_MIN_SIGNIFICANT_COMPONENTS
+        )
+        return plausible, metrics
+
+    def _debug_ocr_raw(debug: dict[str, Any]) -> str:
+        return json.dumps(debug, ensure_ascii=False, separators=(",", ":"))
+
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    mean_val, std_val = cv2.meanStdDev(gray)
+    mean_luma = float(mean_val[0][0])
+    std_luma = float(std_val[0][0])
+    debug: dict[str, Any] = {
+        "mean_luma": round(mean_luma, 3),
+        "std_luma": round(std_luma, 3),
+        "bounds": bounds,
+    }
+    if std_luma < DIGITAL_MIN_STDDEV or (mean_luma >= DIGITAL_MAX_MEAN and std_luma < DIGITAL_MIN_STDDEV * 2):
+        debug["reject_reason"] = "luma_or_contrast"
+        return CVResult(value=None, ok=False, error="OCR не удалось распознать число", ocr_raw=_debug_ocr_raw(debug), debug=debug)
+    plausible, plausibility = _frame_plausibility(gray)
+    debug["plausibility"] = plausibility
+    if not plausible:
+        debug["reject_reason"] = "no_digit_like_components"
+        return CVResult(
+            value=None,
+            ok=False,
+            error="Кадр невалиден для OCR (тёмный/однотонный/без цифр)",
+            ocr_raw=_debug_ocr_raw(debug),
+            debug=debug,
+        )
     h, w = gray.shape[:2]
     # Для цифровых индикаторов OCR заметно стабильнее на увеличенном ROI.
     target_h = 160
@@ -148,6 +220,8 @@ def _recognize_digital(image: np.ndarray) -> CVResult:
     kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
     variants.append(cv2.morphologyEx(th_otsu, cv2.MORPH_OPEN, kernel))
     variants.append(cv2.morphologyEx(cv2.bitwise_not(th_otsu), cv2.MORPH_OPEN, kernel))
+    variants.append(cv2.morphologyEx(th_otsu, cv2.MORPH_CLOSE, kernel))
+    variants.append(cv2.morphologyEx(cv2.bitwise_not(th_otsu), cv2.MORPH_CLOSE, kernel))
 
     def _normalize_numeric_token(token: str) -> str | None:
         token = token.replace(",", ".").replace(" ", "")
@@ -172,9 +246,18 @@ def _recognize_digital(image: np.ndarray) -> CVResult:
         return _normalize_numeric_token(m.group(0))
 
     psm_modes = (7, 8, 6, 13)
+    def _candidate_key(value: float) -> str:
+        if abs(value - round(value)) < 1e-6:
+            return str(int(round(value)))
+        return f"{value:.6g}"
+
+    def _candidate_in_bounds(value: float) -> bool | None:
+        if bounds is None:
+            return None
+        return bounds[0] <= value <= bounds[1]
+
     raw_candidates: list[str] = []
-    best: tuple[float, float, str, str] | None = None
-    # tuple = (score, value, token, raw)
+    grouped: dict[str, dict[str, Any]] = {}
 
     for img in variants:
         for psm in psm_modes:
@@ -193,14 +276,27 @@ def _recognize_digital(image: np.ndarray) -> CVResult:
             except ValueError:
                 continue
 
-            score = 0.0
-            # Предпочитаем токены с 2+ символами и десятичной частью (типичный счетчик).
-            if len(token.replace("-", "")) >= 2:
-                score += 1.2
-            if "." in token:
-                score += 0.8
+            digits = token.replace("-", "").replace(".", "")
+            digit_count = len(digits)
+            decimal_places = len(token.rsplit(".", 1)[1]) if "." in token else 0
+            score = 1.0
+            if digit_count >= 2:
+                score += 1.1
+            if token.startswith("-"):
+                score += 0.5
+            if "." not in token:
+                score += 0.45
+            elif decimal_places > 2:
+                score -= 1.1
+
+            in_bounds = _candidate_in_bounds(value)
+            if in_bounds is True:
+                score += 0.6
+            elif in_bounds is False:
+                score -= 2.0
 
             # Добавляем уверенность из image_to_data (если доступна).
+            max_conf: float | None = None
             try:
                 data = pytesseract.image_to_data(img, config=config, output_type=pytesseract.Output.DICT)
                 conf_vals = [
@@ -209,19 +305,80 @@ def _recognize_digital(image: np.ndarray) -> CVResult:
                     if str(c).strip() not in {"", "-1"} and str(t).strip()
                 ]
                 if conf_vals:
-                    score += max(conf_vals) / 100.0
+                    max_conf = max(conf_vals)
+                    score += max_conf / 100.0
             except Exception:
                 # image_to_data может падать на некоторых билдах tesseract; не роняем распознавание.
                 pass
 
-            if best is None or score > best[0]:
-                best = (score, value, token, raw)
+            key = _candidate_key(value)
+            group = grouped.setdefault(
+                key,
+                {
+                    "value": value,
+                    "tokens": [],
+                    "raw": [],
+                    "score": 0.0,
+                    "best_single_score": 0.0,
+                    "best_raw": raw,
+                    "max_conf": None,
+                    "count": 0,
+                    "in_bounds": in_bounds,
+                },
+            )
+            group["tokens"].append(token)
+            group["raw"].append(raw)
+            group["count"] += 1
+            group["score"] += score
+            if score > group["best_single_score"]:
+                group["best_single_score"] = score
+                group["value"] = value
+                group["best_raw"] = raw
+            if max_conf is not None and (group["max_conf"] is None or max_conf > group["max_conf"]):
+                group["max_conf"] = max_conf
 
-    if best is not None:
-        return CVResult(value=best[1], ok=True, ocr_raw=best[3])
+    ranked: list[dict[str, Any]] = []
+    for key, group in grouped.items():
+        count = int(group["count"])
+        consensus_bonus = min(3.0, max(0, count - 1) * 0.85)
+        group["score"] = float(group["score"]) + consensus_bonus
+        group["key"] = key
+        group["score"] = round(float(group["score"]), 3)
+        ranked.append(group)
+    ranked.sort(key=lambda x: (float(x["score"]), int(x["count"]), float(x["best_single_score"])), reverse=True)
+
+    debug["raw_candidates"] = [x for x in raw_candidates if x][:20]
+    debug["ranked_candidates"] = [
+        {
+            "value": item["value"],
+            "tokens": item["tokens"][:5],
+            "count": item["count"],
+            "score": item["score"],
+            "max_conf": item["max_conf"],
+            "in_bounds": item["in_bounds"],
+        }
+        for item in ranked[:8]
+    ]
+
+    if ranked:
+        best = ranked[0]
+        warnings: list[str] = []
+        if int(best["count"]) < 2 and float(best["score"]) < 3.2:
+            warnings.append("digital_ocr_low_consensus")
+        debug["selected"] = {
+            "value": best["value"],
+            "token": best["tokens"][0] if best["tokens"] else None,
+            "score": best["score"],
+            "count": best["count"],
+            "raw": best["best_raw"],
+        }
+        if float(best["score"]) >= DIGITAL_MIN_ACCEPT_SCORE:
+            return CVResult(value=float(best["value"]), ok=True, ocr_raw=_debug_ocr_raw(debug), warnings=warnings or None, debug=debug)
 
     joined = " | ".join(x for x in raw_candidates if x)
-    return CVResult(value=None, ok=False, error=f"OCR failed: '{joined}'", ocr_raw=joined)
+    debug["reject_reason"] = "no_acceptable_candidate"
+    debug["joined_raw"] = joined
+    return CVResult(value=None, ok=False, error="OCR не удалось распознать число", ocr_raw=_debug_ocr_raw(debug), debug=debug)
 
 
 def _angle_from_center(center: tuple[float, float], point: tuple[float, float]) -> float:
@@ -816,7 +973,21 @@ def recognize_from_image(
     roi_geom_warnings: list[str] = []
     _append_roi_geometry_warnings(roi_geom_warnings, roi_image, roi_data, image.shape)
     if logger.gauge_type == GaugeType.digital:
-        return _merge_cv_warnings(_recognize_digital(roi_image), roi_geom_warnings)
+        bounds = None
+        if logger.min_value is not None and logger.max_value is not None:
+            lo, hi = float(logger.min_value), float(logger.max_value)
+            bounds = (lo, hi) if lo <= hi else (hi, lo)
+        digital_result = _recognize_digital(roi_image, bounds=bounds)
+        merged = _merge_cv_warnings(digital_result, roi_geom_warnings)
+        # Для digital слишком большой ROI (почти весь кадр) резко повышает риск OCR-мусора с оверлеев.
+        if merged.ok and merged.warnings and "roi_covers_almost_entire_frame" in merged.warnings:
+            return replace(
+                merged,
+                value=None,
+                ok=False,
+                error="ROI слишком широкий для надёжного digital OCR; сузьте область до окна показаний",
+            )
+        return merged
     rx, ry = _roi_origin(roi_data)
     cal_roi = _calibration_to_roi_coords(calibration_data, rx, ry)
     return _merge_cv_warnings(_recognize_analog(roi_image, cal_roi), roi_geom_warnings)

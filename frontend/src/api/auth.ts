@@ -21,6 +21,13 @@ export async function login(email: string, password: string): Promise<LoginRespo
   });
 }
 
+export async function register(email: string, password: string): Promise<LoginResponse> {
+  return apiFetch<LoginResponse>("/api/v1/auth/register", {
+    method: "POST",
+    body: JSON.stringify({ email, password }),
+  });
+}
+
 export async function getMe(): Promise<AuthUser> {
   return apiFetch<AuthUser>("/api/v1/auth/me");
 }
