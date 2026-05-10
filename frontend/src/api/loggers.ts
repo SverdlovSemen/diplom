@@ -57,11 +57,11 @@ export type BulkMonitoringUpdate = {
 };
 
 export async function listLoggers(): Promise<Logger[]> {
-  return apiFetch<Logger[]>("/api/v1/loggers");
+  return apiFetch<Logger[]>("/api/v1/loggers/");
 }
 
 export async function createLogger(payload: LoggerCreate): Promise<Logger> {
-  return apiFetch<Logger>("/api/v1/loggers", {
+  return apiFetch<Logger>("/api/v1/loggers/", {
     method: "POST",
     body: JSON.stringify(payload),
   });
@@ -90,4 +90,3 @@ export async function bulkUpdateMonitoring(payload: BulkMonitoringUpdate): Promi
     body: JSON.stringify(payload),
   });
 }
-

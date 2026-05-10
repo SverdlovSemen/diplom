@@ -37,7 +37,7 @@ export async function listMeasurements(params?: MeasurementListParams): Promise<
   if (params?.to) q.set("to", params.to);
   q.set("offset", String(params?.offset ?? 0));
   q.set("limit", String(params?.limit ?? 100));
-  return apiFetch<MeasurementListResponse>(`/api/v1/measurements?${q.toString()}`);
+  return apiFetch<MeasurementListResponse>(`/api/v1/measurements/?${q.toString()}`);
 }
 
 const CHART_PAGE_SIZE = 500;
@@ -117,7 +117,7 @@ export async function listMeasurementAlerts(
   return apiFetch<MeasurementAlert[]>(`/api/v1/measurements/alerts?${q.toString()}`);
 }
 
-const apiBaseUrl = (import.meta.env.VITE_API_BASE_URL as string | undefined) ?? "http://localhost:8000";
+const apiBaseUrl = (import.meta.env.VITE_API_BASE_URL as string | undefined) ?? "";
 
 export type MeasurementExportFormat = "csv" | "xlsx" | "pdf";
 
@@ -205,4 +205,3 @@ export async function testRecognize(loggerId: string, body?: TestRecognizeBody):
     body: JSON.stringify(body ?? {}),
   });
 }
-

@@ -22,7 +22,7 @@ export function adminRoleRequestStatusLabel(status: AdminRoleRequestStatus | nul
 }
 
 export async function createAdminRoleRequest(): Promise<void> {
-  await apiFetch("/api/v1/admin-role-requests", {
+  await apiFetch("/api/v1/admin-role-requests/", {
     method: "POST",
   });
 }
@@ -33,7 +33,7 @@ export async function getMyAdminRoleRequest(): Promise<AdminRoleRequest | null> 
 
 export async function listAdminRoleRequests(status?: AdminRoleRequestStatus): Promise<AdminRoleRequest[]> {
   const q = status ? `?status=${encodeURIComponent(status)}` : "";
-  return apiFetch<AdminRoleRequest[]>(`/api/v1/admin-role-requests${q}`);
+  return apiFetch<AdminRoleRequest[]>(`/api/v1/admin-role-requests/${q}`);
 }
 
 export async function approveAdminRoleRequest(id: string, reviewComment?: string): Promise<AdminRoleRequest> {

@@ -6,7 +6,7 @@ import { buildMediaUrl } from "../api/media";
 import { captureNow, listMeasurements, testRecognize, type Measurement, type TestRecognizeResult } from "../api/measurements";
 import type { GaugeType } from "../api/loggers";
 
-const apiBase = (import.meta.env.VITE_API_BASE_URL as string | undefined) ?? "http://localhost:8000";
+const apiBase = (import.meta.env.VITE_API_BASE_URL as string | undefined) ?? "";
 
 const DEFAULT_SNAPSHOT_ERROR = "Нет активного потока. Запустите трансляцию.";
 const SNAPSHOT_FETCH_TIMEOUT_MS = 47_000;
@@ -927,4 +927,3 @@ export function LoggerSetupPage(): React.ReactElement {
     </div>
   );
 }
-
